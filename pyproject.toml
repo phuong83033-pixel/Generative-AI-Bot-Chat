@@ -10,15 +10,37 @@ dependencies = [
     "sounddevice",
     "numpy",
     "pyyaml",
-    "python-dotenv"
+    "python-dotenv",
+    # torch is imported by perception/vad.py (Silero VAD) and runtime/vram.py.
+    # Install the CUDA build FIRST, from the PyTorch index, or pip resolves a
+    # CPU-only wheel here and CUDA silently disappears:
+    #   pip install torch --index-url https://download.pytorch.org/whl/cu121
+    # An already-satisfied torch is left untouched by `pip install -e .`.
+    "torch",
 ]
 
 [project.optional-dependencies]
 stt = ["faster-whisper"]
 llm = ["llama-cpp-python"]
-tts = ["edge-tts"]
+# pydub decodes Edge-TTS mp3 to PCM and shells out to ffmpeg, which must be on PATH.
+# pydub needs stdlib `audioop`, removed in Python 3.13 - do not move past 3.12 without
+# replacing it (soundfile + av are the drop-in route).
+tts = ["edge-tts", "pydub"]
 dev = ["pytest", "pytest-asyncio"]
-all = ["faster-whisper", "llama-cpp-python", "edge-tts", "pytest", "pytest-asyncio"]
+all = [
+    "faster-whisper",
+    "llama-cpp-python",
+    "edge-tts",
+    "pydub",
+    "pytest",
+    "pytest-asyncio",
+]
 
 [project.scripts]
 amadeus = "amadeus.main:main"
+
+# Without this, setuptools auto-discovery sees amadeus/, config/, scripts/, data/
+# and venv/ as competing top-level packages and refuses to build (flat-layout
+# ambiguity). Only the amadeus package is importable code.
+[tool.setuptools.packages.find]
+include = ["amadeus*"]

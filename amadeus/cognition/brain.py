@@ -2,7 +2,15 @@ import asyncio
 import time
 from abc import ABC, abstractmethod
 from typing import AsyncIterator
-from llama_cpp import Llama
+
+# MUST run before `import llama_cpp`. The prebuilt CUDA wheel needs cudart64_12.dll
+# and cublas64_12.dll on the DLL search path; this machine has no CUDA Toolkit, so
+# they are borrowed from torch's bundled cu12 runtime. See runtime/cuda_dlls.py.
+from amadeus.runtime.cuda_dlls import ensure_cuda_dlls
+
+ensure_cuda_dlls()
+
+from llama_cpp import Llama  # noqa: E402  - import order is load-bearing
 from amadeus.trace import get_tracer
 from amadeus.bus import EventBus
 from amadeus.runtime.vram import vram_guard, log_vram

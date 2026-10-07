@@ -38,7 +38,9 @@ class WhisperSTT:
             segments, info = self.model.transcribe(
                 audio,
                 language=self.language,
-                beam_size=5
+                # Greedy. beam_size=5 is roughly 2-3x slower for marginal
+                # accuracy gain and this sits on the realtime path.
+                beam_size=1,
             )
             text = " ".join([segment.text for segment in segments])
             return text.strip()
@@ -49,7 +51,7 @@ class WhisperSTT:
             text = await loop.run_in_executor(None, _run_transcribe)
             
         if self.bus:
-            self.bus.publish("TranscriptReady", {"text": text})
+            await self.bus.publish("TranscriptReady", {"text": text})
             
         return text
 

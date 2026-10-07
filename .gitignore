@@ -1,2 +1,8 @@
 venv/
 .env
+__pycache__/
+*.pyc
+data/models/
+data/logs/
+amadeus_ai.egg-info/
+*.egg-info/

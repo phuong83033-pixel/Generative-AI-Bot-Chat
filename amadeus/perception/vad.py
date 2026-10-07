@@ -66,7 +66,7 @@ class SileroVAD:
                     in_speech = True
                     self.tracer.info("Speech started.")
                     if self.bus:
-                        self.bus.publish("SpeechStart", {})
+                        await self.bus.publish("SpeechStart", {})
                     speech_buffer.extend(list(ring_buffer))
                     speech_buffer.append(chunk)
                     silence_accumulated_ms = 0.0
@@ -79,7 +79,7 @@ class SileroVAD:
                     if silence_accumulated_ms >= self.silence_timeout_ms:
                         self.tracer.info("Silence timeout reached. Speech ended.")
                         if self.bus:
-                            self.bus.publish("SpeechEnd", {})
+                            await self.bus.publish("SpeechEnd", {})
                         return np.concatenate(speech_buffer)
                 else:
                     silence_accumulated_ms = 0.0

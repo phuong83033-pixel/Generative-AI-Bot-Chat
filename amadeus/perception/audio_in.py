@@ -19,22 +19,27 @@ class MicrophoneStream:
         self.tracer = get_tracer("audio_in")
         
         self.queue: asyncio.Queue[np.ndarray] = asyncio.Queue()
-        self.stream: Optional[sd.InputStream] = None
-        self._loop = asyncio.get_event_loop()
+        self._stream: Optional[sd.InputStream] = None
+        # BLOCKER 3: bound lazily in start(), inside the running loop.
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
 
     def _audio_callback(self, indata: np.ndarray, frames: int, time, status: sd.CallbackFlags):
         if status:
             self.tracer.warning(f"Audio callback status: {status}")
+        if self._loop is None:
+            return
         data = indata.copy().flatten()
         self._loop.call_soon_threadsafe(self.queue.put_nowait, data)
 
     async def start(self) -> None:
         """Start recording."""
-        if self.stream is not None:
+        if self._stream is not None:
             self.tracer.warning("Stream already started.")
             return
 
-        self.stream = sd.InputStream(
+        self._loop = asyncio.get_running_loop()
+
+        self._stream = sd.InputStream(
             samplerate=self.sample_rate,
             channels=self.channels,
             dtype='float32',
@@ -42,15 +47,15 @@ class MicrophoneStream:
             device=self.device,
             callback=self._audio_callback
         )
-        self.stream.start()
+        self._stream.start()
         self.tracer.info("Microphone stream started.")
 
     async def stop(self) -> None:
         """Stop recording."""
-        if self.stream is not None:
-            self.stream.stop()
-            self.stream.close()
-            self.stream = None
+        if self._stream is not None:
+            self._stream.stop()
+            self._stream.close()
+            self._stream = None
             self.tracer.info("Microphone stream stopped.")
 
     async def read_chunk(self) -> np.ndarray:

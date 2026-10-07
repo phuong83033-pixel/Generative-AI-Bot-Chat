@@ -284,18 +284,25 @@ The system needs continuous awareness for natural interruption and full-duplex i
 
 The architecture is designed around the following target measurements:
 
-| Metric | Target |
-|---|---:|
-| First audible syllable p50 | ≤ 1200 ms |
-| Optimized first syllable | ~900 ms |
-| First audible syllable p95 | ≤ 1800 ms |
-| Optimized p95 | ~1300 ms |
-| Barge-in reaction | ≤ 150 ms |
-| Backchannel | ≤ 300 ms |
-| Sustained LLM decoding | ≥ 25 tok/s |
-| Peak VRAM | ≤ 3.6 GB |
+| Metric | Target | Measured (2026-10-07) |
+|---|---:|---:|
+| First audible syllable p50 | ≤ 1200 ms | not yet - needs `main.py` |
+| Optimized first syllable | ~900 ms | — |
+| First audible syllable p95 | ≤ 1800 ms | not yet |
+| Optimized p95 | ~1300 ms | — |
+| Barge-in reaction | ≤ 150 ms | not yet |
+| Backchannel | ≤ 300 ms | — |
+| Sustained LLM decoding | ≥ 25 tok/s | **41.6 tok/s** PASS |
+| LLM time to first token | (not set) | **82 ms** |
+| Peak VRAM | ≤ 3.6 GB | **3398 MB (3.32 GB)** PASS |
 
 These measurements should be treated as engineering requirements rather than optional optimizations.
+
+End-to-end latency cannot be measured until `amadeus/main.py` exists. The two
+numbers that *are* measured both pass, and decode throughput has useful margin:
+41.6 tok/s against conversational speech of roughly 4 tok/s means the LLM is
+about 10x faster than the mouth it feeds, so the clause chunker will never
+starve. See section 31 for the full measurement record and method.
 
 ---
 
@@ -305,17 +312,50 @@ The RTX 2050 has approximately 4 GB VRAM, therefore model selection must be cons
 
 The planned Tier A stack is approximately:
 
-| Component | Configuration | Approx. VRAM |
-|---|---|---:|
-| LLM | Qwen2.5-3B-Instruct GGUF Q4_K_M | ~2.35 GB |
-| STT | faster-whisper small int8_float16 | ~600 MB |
-| VAD | Silero VAD CPU | CPU |
-| AEC | WebRTC AEC3 CPU | CPU |
-| Backchannel | CPU | CPU |
-| TTS | Kokoro-82M int8 CPU | CPU |
-| Embeddings | multilingual-e5-small CPU | CPU |
-| Avatar | VTube Studio / iGPU | iGPU |
-| Total | Approximate | ~3.45 GB |
+| Component | Configuration | Estimated | **Measured** |
+|---|---|---:|---:|
+| CUDA context | one process | ~250 MB | **790 MB** |
+| LLM | Qwen2.5-3B-Instruct GGUF Q4_K_M, n_ctx 2048 | ~2.35 GB | **2210 MB** |
+| STT | faster-whisper small int8_float16 | ~600 MB | **370 MB** |
+| VAD | Silero VAD CPU | CPU | CPU |
+| AEC | WebRTC AEC3 CPU | CPU | CPU |
+| Backchannel | CPU | CPU | CPU |
+| TTS | Kokoro-82M int8 CPU | CPU | CPU |
+| Embeddings | multilingual-e5-small CPU | CPU | CPU |
+| Avatar | VTube Studio / iGPU | iGPU | iGPU |
+| **Peak** | both GPU models resident | ~3.45 GB | **3398 MB** |
+| **Headroom** | of 4096 MB | ~650 MB | **698 MB** |
+
+Measured on a clean GPU, 2026-10-07, via `scripts/bench_vram.py`. The total came
+in almost exactly on estimate (3398 MB measured vs 3450 MB predicted) but the
+distribution was wrong in both directions: the CUDA context costs 3x the estimate
+(790 MB, not 250 MB) while Whisper costs only 60% of it (370 MB, not 600 MB).
+
+Two consequences worth keeping in mind:
+
+* The 790 MB CUDA context is the single largest fixed cost after the LLM, which
+  strengthens the case for keeping everything in **one** process. The original
+  plan assumed an Ollama server plus a Python client; at 790 MB per context that
+  second process would cost more than Whisper does. In-process
+  `llama-cpp-python` avoids it.
+* Headroom is 698 MB, so exactly one Tier B upgrade fits (see section 11), and
+  only if nothing else touches the GPU.
+
+## The GPU must be effectively exclusive
+
+This is not a soft preference. A competing process does not produce a clean
+failure - llama.cpp silently offloads layers to CPU and throughput collapses.
+Measured on this machine, with a game holding 2815 MB of the 4096 MB:
+
+| | Game running | Clean GPU |
+|---|---:|---:|
+| Time to first token | 1732 ms | **82 ms** |
+| Decode | 5.3 tok/s | **41.6 tok/s** |
+
+A 21x difference in TTFT with no error, no warning and no log line. This is why
+`runtime/vram.py` exposes `require_free()` and why startup should call it: the
+budget below assumes the GPU is yours alone, and that assumption has to be
+checked rather than hoped for.
 
 This leaves limited headroom.
 
@@ -1194,51 +1234,294 @@ M15 Persona LoRA
 
 # 30. M0 — Environment
 
-First establish a reproducible Python environment.
+**Status: COMPLETE (2026-10-07).** This section records what was actually built,
+in order, including the problems hit. `scripts/check_environment.py` is the
+executable version of this section — run it to confirm the machine is ready.
 
-Create:
+## 30.1 Toolchain survey
 
-```text
-pyproject.toml
-.env.example
-README.md
-config/
+The first question was whether `llama-cpp-python` could be built from source.
+Survey result:
+
+| Tool | Present | Consequence |
+|---|---|---|
+| CUDA Toolkit (`nvcc`) | NO | cannot compile CUDA kernels |
+| CMake | NO | cannot drive the build |
+| MSVC / VS Build Tools | NO (only SQL Server Mgmt Studio) | no C++ compiler |
+| MSVC runtime (`MSVCP140.dll`) | yes | prebuilt binaries can load |
+| NVIDIA driver (`nvcuda.dll`) | yes | GPU reachable |
+| ffmpeg | NO | installed below |
+| winget | yes | used for ffmpeg |
+| Free disk | 59.9 GB | sufficient |
+
+Building from source would have required roughly 5–10 GB of toolchain (CUDA
+Toolkit + MSVC build tools + CMake). **Decision: use the prebuilt CUDA wheel
+instead.** The MSVC *runtime* is already present, which is all a prebuilt binary
+needs.
+
+## 30.2 Virtual environment and Python dependencies
+
+`venv/` already existed with Python 3.12.10, `torch 2.5.1+cu121` and `numpy`.
+Everything else was missing.
+
+```bash
+venv/Scripts/python.exe -m pip install -e ".[stt,tts,dev]"
 ```
 
-Verify:
+**Problem 1 — setuptools refused to build.** Flat-layout auto-discovery saw
+`amadeus/`, `config/`, `scripts/`, `data/` and `venv/` as competing top-level
+packages:
 
 ```text
-Python
-CUDA
-PyTorch
-GPU visibility
-Audio devices
-Required system packages
+error: Multiple top-level packages discovered in a flat-layout
 ```
 
-Do not start writing the AI logic before the environment is known to work.
+Fixed by declaring packages explicitly in `pyproject.toml`:
+
+```toml
+[tool.setuptools.packages.find]
+include = ["amadeus*"]
+```
+
+The install then succeeded, and critically left `torch 2.5.1+cu121` untouched — an
+already-satisfied unpinned requirement is not re-resolved, so the hand-installed
+CUDA build survived.
+
+## 30.3 llama-cpp-python with CUDA
+
+```bash
+venv/Scripts/python.exe -m pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121
+```
+
+**Problem 2 — pip downloaded the wheel at ~190 kB/s and produced a corrupt file:**
+
+```text
+ERROR: Wheel llama-cpp-python located at ...whl is invalid.
+```
+
+A throughput test against the same URL showed 4.4 MB/s with HTTP 206 range
+support, so the bottleneck was pip, not the network. Fixed by fetching the wheel
+directly with resume support, then installing from the local file:
+
+```bash
+curl -L -C - --retry 5 -o llama_cpp_python-0.3.4-cp312-cp312-win_amd64.whl https://github.com/abetlen/llama-cpp-python/releases/download/v0.3.4-cu121/llama_cpp_python-0.3.4-cp312-cp312-win_amd64.whl
+venv/Scripts/python.exe -m pip install ./llama_cpp_python-0.3.4-cp312-cp312-win_amd64.whl
+```
+
+448,299,770 bytes, verified as a valid zip with 73 members before installing.
+
+**Problem 3 — the wheel installed but would not import:**
+
+```text
+RuntimeError: Failed to load shared library ...llama_cpp\lib\llama.dll:
+Could not find module ... (or one of its dependencies).
+```
+
+The error names `llama.dll`, which is misleading. Reading the PE import tables
+gave the real chain:
+
+```text
+llama.dll  ->  ggml.dll  ->  ggml-cuda.dll  ->  cudart64_12.dll   MISSING
+                                            ->  cublas64_12.dll   MISSING
+                                            ->  nvcuda.dll        present (driver)
+```
+
+The wheel links against the CUDA runtime but does not bundle it, and there is no
+CUDA Toolkit on this machine. However `torch 2.5.1+cu121` ships exactly those
+libraries in `venv/Lib/site-packages/torch/lib/`:
+
+| DLL | Size |
+|---|---:|
+| `cublasLt64_12.dll` | 513.9 MB |
+| `cublas64_12.dll` | 93.5 MB |
+| `cudart64_12.dll` | 0.5 MB |
+| total | **608 MB** |
+
+Copying 608 MB into `llama_cpp/lib/` was rejected as wasteful. Instead
+`amadeus/runtime/cuda_dlls.py` adds the torch lib directory to the process DLL
+search path via `os.add_dll_directory()`, and `cognition/brain.py` calls it
+**before** importing `llama_cpp`. The shim also falls back to the `nvidia-*-cu12`
+pip wheels and to `CUDA_PATH` if either ever exists.
+
+Result:
+
+```text
+ggml_cuda_init: found 1 CUDA devices:
+  Device 0: NVIDIA GeForce RTX 2050, compute capability 8.6, VMM: yes
+llama_cpp          : 0.3.4
+GPU offload support: True
+```
+
+**This import order is load-bearing.** Importing `llama_cpp` before the shim
+poisons the process — the failed library load is not retried.
+
+## 30.4 ffmpeg
+
+`pydub` shells out to the `ffmpeg` binary to decode Edge-TTS mp3 output.
+
+```powershell
+winget install --id Gyan.FFmpeg --scope user
+```
+
+Installed ffmpeg 9.0.2 and added its directory to the **user** PATH. Already
+running shells do not inherit that, so a terminal restart is required;
+`check_environment.py` detects this case and reports WARN rather than FAIL.
+
+Note that `av` (PyAV) is already installed as a `faster-whisper` dependency and
+bundles the ffmpeg libraries, so `synthesis/edge.py` could drop both `pydub` and
+the external binary. Worth doing when `pydub` becomes a problem — it needs the
+stdlib `audioop` module, removed in Python 3.13.
+
+## 30.5 Model weights
+
+```bash
+curl -L -C - -o data/models/qwen2.5-3b-instruct-q4_k_m.gguf https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/main/qwen2.5-3b-instruct-q4_k_m.gguf
+```
+
+2,104,932,768 bytes at ~6.5 MB/s, magic bytes verified as `GGUF`. The filename in
+the official Qwen repo matches `config/settings.yaml` exactly, so no rename was
+needed.
+
+## 30.6 Final state
+
+```text
+Python                3.12.10
+torch                 2.5.1+cu121   (CUDA 12.1, sm_86)
+llama-cpp-python      0.3.4 cu121   GPU offload: True
+faster-whisper        1.2.1         (pulls ctranslate2 4.8.2, av, onnxruntime)
+edge-tts              7.2.8
+pydub                 0.25.1        + ffmpeg 9.0.2
+sounddevice           0.5.6
+pyyaml / python-dotenv / pytest / pytest-asyncio
+Qwen2.5-3B Q4_K_M     2007 MB, valid GGUF
+```
+
+Verify with:
+
+```bash
+venv/Scripts/python.exe scripts/check_environment.py
+```
+
+All checks pass. Audio devices resolve to Realtek mic in / headphones out —
+**use headphones**, `perception/aec.py` is still a pass-through stub.
 
 ---
 
 # 31. M1 — Measurement
 
-Create:
+**Status: VRAM and LLM throughput COMPLETE. End-to-end latency BLOCKED on `main.py`.**
 
-```text
-amadeus/runtime/vram.py
-amadeus/trace.py
-scripts/check_environment.py
-scripts/benchmark_vram.py
-scripts/benchmark_latency.py
-```
-
-The first goal is to answer:
+The goal of this milestone is to answer three questions with numbers rather than
+estimates:
 
 ```text
 How much VRAM is available?
 How much VRAM does each model use?
 How long does each stage take?
 ```
+
+## 31.1 The bug that made measurement necessary
+
+`runtime/vram.py` originally measured with `torch.cuda.memory_allocated()`. The
+first benchmark exposed the problem immediately:
+
+| Stage | Driver reports | `memory_allocated()` reports |
+|---|---:|---:|
+| baseline | 790 MB | 0.0 MB |
+| + Qwen2.5-3B loaded | 3973 MB | **0.0 MB** |
+
+`memory_allocated()` only sees the torch caching allocator. The two largest
+consumers in this project do not use it — `llama-cpp-python` allocates through
+ggml-cuda and `faster-whisper` through CTranslate2, both straight to the CUDA
+driver. **The VRAM guard was blind to the entire budget it existed to protect**,
+and would have reported a comfortable margin right up to an OOM crash.
+
+`vram.py` was rewritten to use `torch.cuda.mem_get_info()`, which queries the
+driver and therefore sees every allocation in the process regardless of library.
+`torch_allocated_mb` is retained as a diagnostic field only, never for budget
+decisions.
+
+## 31.2 The first run was void
+
+The first clean-looking benchmark produced TTFT 1732 ms and 5.3 tok/s, roughly 6x
+worse than predicted. Cause:
+
+```text
+nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv
+15864, MonsterHunterWorld.exe, 2815 MiB
+```
+
+A game held 2815 MB of the 4096 MB, leaving llama.cpp ~1.1 GB, so it silently
+offloaded most layers to CPU. **No error, no warning.** Those numbers were
+discarded, not recorded.
+
+This produced two permanent changes: `require_free()` in `runtime/vram.py`, which
+refuses at startup rather than degrading, and a free-VRAM check plus
+GPU-process listing in `check_environment.py`.
+
+## 31.3 Measured results, clean GPU
+
+`scripts/bench_vram.py`, 2026-10-07, GPU confirmed at 0 MiB used / 3962 MiB free
+before starting:
+
+```text
+GPU            : NVIDIA GeForce RTX 2050
+total VRAM     : 4096 MB
+baseline in use: 790 MB (CUDA context)
+
+faster-whisper small        +370 MB   load 1.81s   free now 2936 MB
+Qwen2.5-3B Q4_K_M          +2210 MB   load 1.25s   free now  726 MB
+
+generation:
+  TTFT            : 82 ms
+  decode          : 83 tok in 1.99s = 41.6 tok/s
+
+peak VRAM        : 3398 MB / 4096 MB (83.0%)
+headroom         : 698 MB
+budget           : WITHIN target of 3686 MB
+```
+
+Estimate versus reality:
+
+| | Estimated | Measured | Verdict |
+|---|---:|---:|---|
+| CUDA context | 250 MB | **790 MB** | 3.2x worse |
+| LLM (n_ctx 2048) | 2350 MB | **2210 MB** | slightly better |
+| Whisper small int8 | 600 MB | **370 MB** | 1.6x better |
+| Peak total | 3450 MB | **3398 MB** | accurate |
+| Decode rate | 30–40 tok/s | **41.6 tok/s** | better |
+
+The aggregate estimate was good; the breakdown was wrong in both directions. The
+actionable finding is the CUDA context at 790 MB — see section 8 for why this
+argues for a single-process design.
+
+Raw results are written to `data/logs/bench_vram.json` on every run.
+
+## 31.4 Still to measure
+
+```text
+scripts/bench_latency.py     - needs main.py; stage-by-stage p50/p95
+scripts/bench_aec.py         - needs real AEC; echo return loss
+```
+
+Whisper transcription latency was not isolated in this pass — the benchmark only
+forces a dummy decode so CTranslate2 allocates. Real STT timing belongs in
+`bench_latency.py`, against actual utterances.
+
+## 31.5 An unprompted quality datapoint
+
+Asked to explain GGUF, the 3B model replied:
+
+> GGUF stands for "Google Generalized Quantized Format," a quantization format
+> developed by Google
+
+Both claims are wrong — GGUF comes from the ggml / llama.cpp project and has no
+connection to Google. This is a clean, unsolicited demonstration of the
+hallucination risk in section 50.5, and empirical support for the
+quality-recovery strategy in section 11: narrow the job to one persona, cap
+output length, and move factual reasoning off the hot path. A 3B model is
+adequate for *being a character* and unreliable as a *reference source*, and the
+persona design should lean on the former rather than inviting the latter.
 
 Do not optimize blindly.
 
