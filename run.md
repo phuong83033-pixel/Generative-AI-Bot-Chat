@@ -2,8 +2,8 @@
 
 Everything needed to get the project running, with copy-paste commands.
 
-> **Current stage: M7 (voice MVP).** A turn-based voice loop:
-> mic → VAD → Whisper → Qwen → clause chunker → Edge-TTS → speakers.
+> **Current stage: M8 (streaming pipeline), on top of the M7 voice loop.** A turn-based voice loop:
+> mic → VAD → Whisper → Qwen → clause chunker → Kokoro (local voice) → speakers.
 > **No avatar, no emotion engine, no memory, no proactive speech yet** — those are
 > M9 through M14. See README §28.
 
@@ -48,7 +48,7 @@ Type or say `exit` to quit. `Ctrl+C` also works.
 | RAM | 8 GB | 15.7 GB |
 | Disk | ~6 GB free | 59.9 GB |
 | Python | **3.10–3.12** (not 3.13) | 3.12.10 |
-| Network | needed for setup and for Edge-TTS at runtime | |
+| Network | needed for setup only. The default voice is local and works offline (the optional Edge-TTS fallback needs it) | |
 
 **Python 3.13 will not work.** `pydub` needs the stdlib `audioop` module, which
 3.13 removed.
@@ -129,7 +129,8 @@ Expect `GPU offload: True`. You can delete `llama_cpp_cu121.whl` afterwards.
 
 ### 3.5 Install ffmpeg
 
-`pydub` shells out to it to decode Edge-TTS audio.
+`pydub` shells out to it to decode Edge-TTS audio. **It is only needed for the optional cloud
+voice** (`tts.provider: edge`); the default local Kokoro voice does not use it.
 
 ```bash
 winget install --id Gyan.FFmpeg --scope user
@@ -148,6 +149,44 @@ curl -L -C - --create-dirs -o data/models/qwen2.5-3b-instruct-q4_k_m.gguf https:
 
 The filename must match `config/settings.yaml` exactly. Both `curl` commands here
 use `-C -`, so a dropped connection resumes rather than restarting.
+
+### 3.7 Download the local voice (Kokoro-82M)
+
+The default voice (`tts.provider: kokoro`) runs on the CPU, offline, using **0 MB of
+VRAM**. It needs two files, 337 MB together, from the official
+[kokoro-onnx](https://github.com/thewh1teagle/kokoro-onnx) release.
+
+The model (310.5 MB, 325,532,387 bytes):
+
+```bash
+curl -L -C - --retry 5 --create-dirs -o data/models/kokoro/kokoro-v1.0.onnx https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx
+```
+
+The voices (26.9 MB, 28,214,398 bytes):
+
+```bash
+curl -L -C - --retry 5 -o data/models/kokoro/voices-v1.0.bin https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin
+```
+
+The Python package (`kokoro-onnx`) is already part of the `tts` extra from §3.3.
+Downloads from GitHub release assets vary a lot in speed (0.3 to 6 MB/s was seen
+here); `-C -` resumes after a drop, so just re-run the same command.
+
+Confirm it loads and says it has 54 voices:
+
+```bash
+.\venv\Scripts\python.exe -c "from kokoro_onnx import Kokoro; k = Kokoro('data/models/kokoro/kokoro-v1.0.onnx', 'data/models/kokoro/voices-v1.0.bin'); print(len(k.get_voices()), 'voices')"
+```
+
+**Use the fp32 file, `kokoro-v1.0.onnx`. Do not "save space" with the 88 MB
+`kokoro-v1.0.int8.onnx`.** On this CPU the int8 model is about 3 times slower:
+5.2 s to speak a 4 s sentence, slower than real time and slower than the cloud
+voice it replaces. onnxruntime's profile showed 83% of the time in one operator
+(`ConvInteger`). The fp32 model takes about 1.5 s for the same sentence. Details are
+in the comment at the top of `amadeus/synthesis/kokoro.py`.
+
+Prefer the cloud voice instead? Set `tts.provider: edge` in `config/settings.yaml`
+(needs network, and ffmpeg from §3.5). Nothing else changes.
 
 ---
 
@@ -173,6 +212,7 @@ Expected:
 [PASS] ffmpeg on PATH - ffmpeg version 9.0.2
 [PASS] audio devices - in: Microphone (...) | out: Headphones (...)
 [PASS] Qwen2.5-3B GGUF - 2007 MB, valid GGUF header
+[PASS] Kokoro voice files - kokoro-v1.0.onnx + voices, sizes verified, fp32
 [PASS] directory data/models
 [PASS] directory data/logs
 [PASS] directory config
@@ -217,6 +257,7 @@ launches read it from cache.
 |---|---|
 | `--text` | type instead of speaking; no mic, VAD or STT |
 | `--turns N` | exit after N turns — useful for benchmarking |
+| `--mute` | no sound: playback is simulated by waiting out each clip's real duration |
 | `--log-level LEVEL` | `DEBUG`, `INFO`, `WARNING`, `ERROR`. Default `INFO` |
 
 Quiet run, three turns:
@@ -241,23 +282,37 @@ taskkill /F /IM python.exe
 Every turn prints a latency breakdown, and the session prints p50/p95 on exit:
 
 ```text
+[first audio at 1095 ms]
+Amadeus > Hello! I'm Amadeus,
+Amadeus > a friendly AI here to chat and explore.
+Amadeus > How can I assist you today?
   turn 1
-    speech_end -> stt_done                 240 ms
+    speech_end -> stt_done                   0 ms
     stt_done -> prompt_built                 0 ms
-    prompt_built -> first_token            306 ms
-    first_token -> first_clause            390 ms
-    first_clause -> tts_done              1909 ms
+    prompt_built -> first_token            174 ms
+    first_token -> first_clause            170 ms
+    first_clause -> tts_done               751 ms
     tts_done -> first_audio_out              0 ms
-    = first audible syllable              2605 ms
+    = first audible syllable              1095 ms
+    silence between clauses                  0 ms max  [0, 0]
 ```
 
-**First audible syllable is currently ~2.6 s against a 1200 ms target, and that
-is expected at M7.** Edge-TTS is a cloud service and accounts for roughly 1900 ms
-of it — about 73%. Everything running locally sums to ~700 ms. Replacing
-Edge-TTS with local Kokoro-82M synthesis at Phase 2 is the fix; there is little
-point optimising the local pipeline before that.
+**First audible syllable is about 1.1 s in text mode** (1062 ms median over 16 test turns,
+against a 1200 ms target; it was 2605 ms with the cloud voice). Two caveats you should know:
 
-Measured resource use with all three models loaded:
+* **Text mode does not include speech-to-text.** In voice mode add Whisper's time to every
+  figure. It has not been measured on real speech yet, so voice mode may sit right at the
+  1200 ms limit.
+* **The first clause is cut short on purpose.** To start speaking sooner, the first clause ends
+  at the first punctuation after 16 characters, or at a word boundary at 30 characters if there
+  is no punctuation. Occasionally that cuts mid-sentence (`...a beloved stimulant | that
+  energizes...`). If it sounds choppy, set `chunker.first_clause_max_chars: null` in
+  `config/settings.yaml`. Speech is then continuous but starts ~600 ms later (p50 ~1700 ms).
+
+"silence between clauses" is the longest pause the listener hears inside a reply. 0 is the
+normal case; a long unpunctuated sentence can still produce a pause of about a second.
+
+Measured resource use with all three models loaded (the local voice uses **0 MB** of VRAM):
 
 ```text
 Qwen2.5-3B Q4_K_M    2210 MB
@@ -370,11 +425,39 @@ vad:
 
 Run with `--log-level DEBUG` to see whether speech is detected at all.
 
-### Edge-TTS fails or hangs
+### `FileNotFoundError: Kokoro model file not found`
 
-Edge-TTS is a cloud service and needs network access. There is no offline voice
-until Kokoro lands at Phase 2. Confirm the rest of the pipeline independently
-with `--text`.
+The local voice files are missing or in the wrong folder. Do §3.7, then run
+`scripts\check_environment.py`: its "Kokoro voice files" line checks both files by exact size,
+so a truncated download is reported instead of failing later when the model loads.
+
+### The voice takes 5 seconds to say a sentence
+
+You are using the int8 model. It is about 3 times slower than fp32 on this CPU and slower than
+real time. Set `tts.model_path` to `data/models/kokoro/kokoro-v1.0.onnx` (§3.7).
+
+### Speech sounds choppy, or cut off mid-sentence
+
+That is the first-clause cap (§6). Set `chunker.first_clause_max_chars: null`. If the *sound
+itself* crackles or has gaps between sentences, set `audio.streaming_output: false` to use the
+older player, and tell me which, since the new output path has not been verified by ear.
+
+### Which speaker is it using?
+
+Windows changes the default output when devices are plugged in, and it may be **Speakers**
+rather than headphones (the stream line in the log names the device). On speakers the agent
+hears itself, because echo cancellation is still a stub (§7, "talking to itself"). Check:
+
+```bash
+.\venv\Scripts\python.exe -c "import sounddevice as sd; print(sd.query_devices(sd.default.device[1])['name'])"
+```
+
+Pick a device with `AMADEUS_AUDIO_OUTPUT_DEVICE` in `.env` (a name fragment such as `Headphones`).
+
+### Using the cloud voice instead
+
+Set `tts.provider: edge` in `config/settings.yaml`. It needs network access and ffmpeg, and adds
+about 1900 ms before the first sound.
 
 ---
 
@@ -387,9 +470,28 @@ first; results are written to `data/logs/bench_vram.json`.
 .\venv\Scripts\python.exe scripts\bench_vram.py
 ```
 
-`scripts/bench_latency.py` does not exist yet — per-turn tracing is already in
-`trace.py` and prints after every turn, but the aggregating script is still to be
-written (README §31.4).
+First-sound latency and the longest silence inside a reply, over 8 prompts (silent: playback is
+simulated, so it is quiet and repeatable). About 3 minutes; close GPU apps first.
+
+```bash
+.\venv\Scripts\python.exe scripts\bench_latency.py --label mytest --repeats 2
+```
+
+Replies are seeded so every run sees identical text, which makes two runs comparable. Try other
+first-clause settings without editing the config:
+
+```bash
+.\venv\Scripts\python.exe scripts\bench_latency.py --label alt --first-min 12 --first-max none
+```
+
+Results go to `data/logs/bench_latency_<label>.json`. It uses typed input, so it does not time
+Whisper.
+
+Run the automated tests (about 10 s, no GPU or sound device needed):
+
+```bash
+.\venv\Scripts\python.exe -m pytest tests -q
+```
 
 ---
 
@@ -409,19 +511,29 @@ llm:
   max_tokens: 256    # reply length cap
   temperature: 0.7
 tts:
-  voice: en-US-AriaNeural   # any Edge-TTS voice
-  rate: "+0%"               # "+20%" speaks faster
+  provider: kokoro          # "kokoro" = local, offline. "edge" = cloud fallback
+  kokoro_voice: af_heart    # 54 voices, e.g. af_bella, af_nicole, bf_emma (British)
+  speed: 1.0                # Kokoro speaking speed
+  threads: 6                # CPU threads for the voice; 6 = physical cores
+chunker:
+  first_clause_min_chars: 16   # see section 6
+  first_clause_max_chars: 30   # null = never cut mid-sentence
+audio:
+  streaming_output: true       # false = older player (adds ~200 ms of silence per clip)
 ```
 
-List available Edge-TTS voices:
+List the Kokoro voices:
 
 ```bash
-.\venv\Scripts\python.exe -m edge_tts --list-voices
+.\venv\Scripts\python.exe -c "from kokoro_onnx import Kokoro; print(sorted(Kokoro('data/models/kokoro/kokoro-v1.0.onnx','data/models/kokoro/voices-v1.0.bin').get_voices()))"
 ```
+
+Only used when `tts.provider: edge`: `voice: en-US-AriaNeural` and `rate: "+0%"`. List the Edge
+voices with `.\venv\Scripts\python.exe -m edge_tts --list-voices`.
 
 ---
 
-## 10. Known limits at M7
+## 10. Known limits at M8
 
 * **No avatar.** Nothing renders. M14.
 * **No emotion engine.** The PAD model is designed, not built. M9.
@@ -430,8 +542,9 @@ List available Edge-TTS voices:
 * **No proactive speech.** It only answers; it never starts a conversation. The
   state machine now permits it, but `drive.py` does not exist. M12.
 * **No barge-in.** You cannot interrupt it mid-sentence. M8.
-* **No echo cancellation.** Headphones required. M8.
-* **Cloud TTS.** Needs network, and costs ~1900 ms per turn. M9.
+* **No echo cancellation.** Headphones required. M13.
+* **Local voice has no emotion.** Kokoro offers a choice of voice and a speed, not pitch or energy control, so mood can only change which voice and how fast. M9.
+* **Never listened to by its author.** The first-clause cap and the new output stream are verified by measurement and tests, not by ear (§6, §7).
 * **Voice path unproven.** The microphone opens and the detector listens, but no
   real utterance has yet been captured and transcribed end to end. Text mode is
   verified working.

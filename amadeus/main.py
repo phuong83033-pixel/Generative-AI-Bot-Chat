@@ -40,6 +40,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
+import time
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -56,13 +57,19 @@ from amadeus.trace import LatencyLog, TurnTrace, get_tracer, setup_logging  # no
 # See README section 31.3.
 MIN_FREE_VRAM_MB = 2600
 
+# Marks the end of a reply on the synthesiser -> player queue.
+_DONE = object()
+
 
 class Amadeus:
     """Owns every component and runs the turn loop."""
 
-    def __init__(self, cfg: AmadeusConfig, *, text_mode: bool = False):
+    def __init__(self, cfg: AmadeusConfig, *, text_mode: bool = False, mute: bool = False):
         self.cfg = cfg
         self.text_mode = text_mode
+        # mute: play through NullPlayer, which waits out each clip's real duration
+        # without making sound. Timing-faithful, so benchmarks stay valid.
+        self.mute = mute
         self.tracer = get_tracer("main")
         self.bus = EventBus()
         self.state = StateManager(self.bus)
@@ -83,6 +90,37 @@ class Amadeus:
 
     # ------------------------------------------------------------------ setup
 
+    def _build_tts(self):
+        """Construct the voice named by settings.yaml `tts.provider`.
+
+        Kokoro is local (CPU, 0 MB VRAM, offline). Edge is the cloud fallback and
+        costs roughly 1900 ms per turn, so it is no longer the default.
+        """
+        t = self.cfg.tts
+        provider = t.provider.lower()
+
+        if provider == "kokoro":
+            from amadeus.synthesis.kokoro import KokoroTTS
+
+            self.tracer.info("Loading TTS (Kokoro, local CPU) ...")
+            return KokoroTTS(
+                model_path=str(PROJECT_ROOT / t.model_path),
+                voices_path=str(PROJECT_ROOT / t.voices_path),
+                voice=t.kokoro_voice,
+                speed=t.speed,
+                threads=t.threads,
+            )
+
+        if provider == "edge":
+            from amadeus.synthesis.edge import EdgeTTS
+
+            self.tracer.info("Loading TTS (Edge, cloud) ...")
+            return EdgeTTS(
+                voice=t.voice, rate=t.rate, output_sample_rate=t.output_sample_rate
+            )
+
+        raise ValueError(f"Unknown tts.provider {t.provider!r}; expected 'kokoro' or 'edge'.")
+
     async def setup(self) -> None:
         """Bind the loop, check VRAM, then load every model once."""
         # CONTRACT 1: must be first, before anything can publish_sync.
@@ -97,10 +135,13 @@ class Amadeus:
         from amadeus.cognition.prompt import PromptBuilder
         from amadeus.synthesis.audio_out import AudioPlayer
         from amadeus.synthesis.chunker import ClauseChunker
-        from amadeus.synthesis.edge import EdgeTTS
 
         self.prompt = PromptBuilder(system_prompt=self.cfg.persona.system_prompt)
-        self.chunker = ClauseChunker(bus=self.bus)
+        self.chunker = ClauseChunker(
+            bus=self.bus,
+            first_clause_min=self.cfg.chunker.first_clause_min_chars,
+            first_clause_max=self.cfg.chunker.first_clause_max_chars,
+        )
 
         self.tracer.info("Loading LLM ...")
         self.brain = QwenProvider(
@@ -114,16 +155,29 @@ class Amadeus:
             bus=self.bus,
         )
 
-        self.tts = EdgeTTS(
-            voice=self.cfg.tts.voice,
-            rate=self.cfg.tts.rate,
-            output_sample_rate=self.cfg.tts.output_sample_rate,
-        )
-        self.player = AudioPlayer(
-            sample_rate=self.tts.sample_rate,
-            device=self.cfg.audio.output_device,
-            bus=self.bus,
-        )
+        self.tts = self._build_tts()
+        from amadeus.synthesis.audio_out import NullPlayer, StreamingAudioPlayer
+
+        streaming = self.cfg.audio.streaming_output
+        if self.mute:
+            # Model whichever real player is configured, so benchmarks stay faithful.
+            self.player = NullPlayer(
+                sample_rate=self.tts.sample_rate,
+                bus=self.bus,
+                lead_s=StreamingAudioPlayer.LEAD_S if streaming else 0.0,
+            )
+        elif streaming:
+            self.player = StreamingAudioPlayer(
+                sample_rate=self.tts.sample_rate,
+                device=self.cfg.audio.output_device,
+                bus=self.bus,
+            )
+        else:
+            self.player = AudioPlayer(
+                sample_rate=self.tts.sample_rate,
+                device=self.cfg.audio.output_device,
+                bus=self.bus,
+            )
 
         if not self.text_mode:
             from amadeus.perception.aec import AECStub
@@ -193,38 +247,91 @@ class Amadeus:
     # -------------------------------------------------------------- cognition
 
     async def _respond(self, user_text: str, trace: TurnTrace, stop: asyncio.Event) -> str:
-        """Generate, synthesize and speak a reply. Returns the full text."""
+        """Generate, synthesize and speak a reply. Returns the full text.
+
+        Two stages run concurrently, joined by a one-slot queue:
+
+            LLM -> chunker -> TTS ──(audio)──> player
+
+        The synthesiser works on clause N+1 while the player is still speaking
+        clause N. The original loop did synth -> play -> synth, so every clause
+        after the first was preceded by silence for as long as it took to
+        synthesise (Kokoro: roughly 0.4 s per second of speech). Pipelining hides
+        that cost for everything except the first clause.
+
+        The queue holds one clip, so synthesis runs at most one clip ahead of
+        playback. Deeper would waste CPU on audio that an interruption throws away.
+        """
         messages = self.prompt.build(user_text)
         trace.stamp("prompt_built")
 
         token_stream = self._tapped_tokens(self.brain.stream(messages, stop), trace)
-
+        ready: asyncio.Queue = asyncio.Queue(maxsize=1)
         spoken: list[str] = []
-        async for clause in self.chunker.process(token_stream, stop):
-            if stop.is_set():
-                break
-            if not trace.has("first_clause"):
-                trace.stamp("first_clause")
+        last_play_end: float | None = None
 
-            audio = await self.tts.synth(clause, stop)
-            if not trace.has("tts_done"):
-                trace.stamp("tts_done")
+        async def synthesize() -> None:
+            async for clause in self.chunker.process(token_stream, stop):
+                if stop.is_set():
+                    break
+                if not trace.has("first_clause"):
+                    trace.stamp("first_clause")
 
-            if audio.size == 0:
-                self.tracer.warning(f"TTS returned no audio for: {clause!r}")
+                audio = await self.tts.synth(clause, stop)
+                if not trace.has("tts_done"):
+                    trace.stamp("tts_done")
+
+                await ready.put((clause, audio))
+            # Sentinel on normal completion only. If this task fails or is
+            # cancelled, _respond cancels the player directly; a put() here could
+            # block forever on a full queue with nobody left to drain it.
+            await ready.put(_DONE)
+
+        async def play() -> None:
+            nonlocal last_play_end
+            while True:
+                item = await ready.get()
+                if item is _DONE:
+                    # play() returns slightly before a clip ends; wait for the real end.
+                    await self.player.drain(stop)
+                    return
+                clause, audio = item
+
+                if stop.is_set():
+                    continue  # interrupted: drain without speaking
+                if audio.size == 0:
+                    self.tracer.warning(f"TTS returned no audio for: {clause!r}")
+                    spoken.append(clause)
+                    continue
+
+                if self.state.current is not SystemState.SPEAKING:
+                    self.state.transition(SystemState.SPEAKING)
+
+                if not trace.has("first_audio_out"):
+                    ms = trace.stamp("first_audio_out")
+                    print(f"[first audio at {ms:.0f} ms]", flush=True)
+
+                print(f"{self.cfg.persona.name} > {clause}", flush=True)
+                if last_play_end is not None:
+                    # Silence the listener actually hears between two clauses.
+                    trace.add_gap((time.perf_counter() - last_play_end) * 1000)
+                await self.player.play(audio, stop)
+                # play() returns lead_s before the clip's audible end (0 for the
+                # blocking player), so that is when the next clip must be queued by.
+                last_play_end = time.perf_counter() + self.player.lead_s
                 spoken.append(clause)
-                continue
 
-            if self.state.current is not SystemState.SPEAKING:
-                self.state.transition(SystemState.SPEAKING)
-
-            if not trace.has("first_audio_out"):
-                ms = trace.stamp("first_audio_out")
-                print(f"[first audio at {ms:.0f} ms]", flush=True)
-
-            print(f"{self.cfg.persona.name} > {clause}", flush=True)
-            await self.player.play(audio, stop)
-            spoken.append(clause)
+        synth_task = asyncio.create_task(synthesize())
+        play_task = asyncio.create_task(play())
+        try:
+            await asyncio.gather(synth_task, play_task)
+        except BaseException:
+            # One side failed or the turn was cancelled: stop the other, wait for
+            # both to unwind, then let the original error propagate.
+            for task in (synth_task, play_task):
+                task.cancel()
+            await asyncio.gather(synth_task, play_task, return_exceptions=True)
+            raise
 
         return " ".join(spoken).strip()
 
@@ -306,6 +413,7 @@ class Amadeus:
         self.tracer.info("Shutting down ...")
         if self.player is not None:
             self.player.stop_immediately()
+            self.player.close()
         if self.mic is not None:
             await self.mic.stop()
 
@@ -334,6 +442,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--turns", type=int, default=None, metavar="N", help="exit after N turns"
     )
+    p.add_argument(
+        "--mute",
+        action="store_true",
+        help="no sound: playback is simulated by waiting out each clip's duration",
+    )
     p.add_argument("--log-level", default=None, help="DEBUG, INFO, WARNING, ERROR")
     return p.parse_args(argv)
 
@@ -343,7 +456,7 @@ def main(argv: list[str] | None = None) -> int:
     cfg = load_config()
     setup_logging(args.log_level or cfg.log_level, log_dir=PROJECT_ROOT / "data" / "logs")
 
-    app = Amadeus(cfg, text_mode=args.text)
+    app = Amadeus(cfg, text_mode=args.text, mute=args.mute)
     try:
         asyncio.run(app.run(max_turns=args.turns))
     except KeyboardInterrupt:

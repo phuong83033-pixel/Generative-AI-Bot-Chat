@@ -987,3 +987,273 @@ past initialization.
 * **Repo layout:** nested git repo with no `.gitmodules`; `agent.py` still 0
   bytes; `testing.py` deleted outside this session and still unstaged.
 * **No avatar.** Nothing in the repo renders anything. README §26 / M14.
+
+---
+
+# PART 4 — Local voice, pipelined playback and the first real latency numbers (M6 / M8)
+
+> **Date:** 2026-11-04
+> **Scope:** Replace the cloud voice with a local one, then bring first-sound latency down to target without making speech stutter.
+> **Status:** Both latency targets met in text mode. **Not yet verified by ear, and not yet measured with real speech through Whisper** (see §31).
+
+Part 3 ended with the pipeline working but slow: 2605 ms to first sound against a
+1200 ms target, 73% of it one cloud call. This part is what it took to fix that, and
+it is mostly a record of assumptions that measurement overturned.
+
+| # | Where | Finding | Outcome |
+|---|---|---|---|
+| 13 | `synthesis/kokoro.py` | The planned int8 voice model is ~3x **slower** than fp32 on this CPU | switched to fp32 |
+| 14 | `main.py` `_respond` | Sequential synth→play→synth put a silence before **every** clause | pipelined |
+| 15 | `synthesis/chunker.py` | First clause = whole first sentence; no early break point | `first_clause_min/max` + backtracking |
+| 16 | `synthesis/audio_out.py` | Real player adds **~200 ms dead air per clip** (invisible to the benchmark) | persistent WASAPI stream |
+| 17 | (my own records) | Three claims I had written down were wrong | corrected, §32 |
+
+New: `synthesis/kokoro.py`, `scripts/bench_latency.py`, `tests/` (59 tests), `NullPlayer`,
+`StreamingAudioPlayer`, `TurnTrace` gap tracking, `--mute`, seeded benchmarking.
+
+---
+
+## 25. Kokoro int8 was the wrong model (13)
+
+The plan said "Kokoro-82M int8 on CPU" and estimated a real-time factor of ~0.25.
+First measurement, same 4.65 s sentence:
+
+| Model | Time | RTF | vs Edge-TTS (1909 ms for this sentence) |
+|---|---:|---:|---|
+| int8, 4 threads (best of a sweep) | 5242 ms | 1.13 | **2.7x slower** than the cloud |
+| fp32, 6 threads | 1668 ms | 0.36 | 13% faster |
+
+Quantising to save compute made it slower. Evidence rather than guesswork: onnxruntime's
+per-operator profile of the int8 graph:
+
+```text
+ConvInteger   4571 ms   83.1%   87 calls
+Sin            220 ms    4.0%
+STFT           158 ms    2.9%
+```
+
+`ConvInteger` is a slow generic CPU kernel. The same convolutions in the fp32 graph run as
+the optimised float `Conv` (972 ms, 53%). The signature of a serial kernel was already
+visible in the thread sweep: int8 took 6051 ms on 1 thread and 6059 ms on 12; fp32 scaled
+properly (3319 ms on 1 thread, 1668 ms on 6).
+
+Changes: the model file and `config.py` default are fp32; `KokoroTTS` builds its own
+`InferenceSession` restricted to `CPUExecutionProvider` (the stock constructor resolves
+providers itself and would pick CUDA if `onnxruntime-gpu` were ever installed, silently
+spending the VRAM this voice exists to avoid); thread count is a setting (`tts.threads: 6`,
+the physical core count, measured faster than 12); a warm-up synth at load removes a
+one-time ~195 ms penalty from the user's first turn; `kokoro_voice` is separate from
+`voice` because Edge and Kokoro voice names are incompatible and sharing one field made
+switching provider fail on an unknown voice. `check_environment.py` now verifies Kokoro
+file sizes exactly (an earlier int8 download had stopped at 241,954 bytes without any
+error) and warns if the int8 model is selected.
+
+VRAM change from loading Kokoro: **+0 MB**, measured.
+
+---
+
+## 26. Sequential playback put silence before every clause (14)
+
+`_respond` ran synth → play → synth, so for every clause after the first the listener heard
+silence for as long as synthesis took. Baseline, 16 turns (8 prompts x 2), real LLM and
+Kokoro, simulated playback:
+
+```text
+first syllable   p50 1840 ms | p95 2704 ms | max 2989
+longest silence  median 1111 ms | worst 3110 ms | turns with a >300 ms hole: 14 of 14
+```
+
+Every multi-clause reply had an audible hole. The fix is a producer/consumer pair with a
+one-slot queue: the synthesiser works on clause N+1 while clause N plays.
+
+```text
+original rules, pipelined:
+longest silence  median 0 ms | worst 795 ms | turns with a >300 ms hole: 2 of 14
+first syllable   p50 1896 ms   (unchanged: pipelining cannot help the first clause)
+```
+
+The queue holds one clip so synthesis runs at most one clip ahead; deeper would waste CPU
+on audio an interruption would throw away. The sentinel is only put on normal completion,
+because a `put()` in a `finally` could block forever on a full queue with no consumer. On
+any failure `_respond` cancels both tasks and re-raises. Tests cover ordering, overlap, a
+real hole being reported, failure with no hang, and stop mid-reply (`test_respond_pipeline.py`).
+
+---
+
+## 27. The first clause decides first-sound latency (15)
+
+After pipelining, time to first sound is almost exactly the synthesis time of the first
+clause, and replies differ hugely in how early they offer a break. Measured cost model for
+this CPU (three clause lengths, interleaved runs):
+
+```text
+synthesis ~= 440 ms fixed + ~19 ms per character      (ONNX inference; nothing outside it matters)
+speech    ~= 15 characters per second
+```
+
+Two constraints follow. For first sound under 1200 ms the opener must be **at most ~35
+characters**. For no pause before clause 2, clause 1 must **play at least as long as clause
+2 takes to synthesise**, which needs **~19+ characters** for a typical next clause. The
+workable window is roughly 19 to 35 characters. `Hello!` (6 characters, 0.8 s of audio)
+cannot cover even the fixed cost of the next clause, so a bare interjection always leaves a
+hole.
+
+Sweep (16 turns, identical seeded replies, pipelined):
+
+| Config | p50 | p95 | silence p90 / worst | turns >300 ms | ≤1200 ms | ≤1800 ms |
+|---|---:|---:|---:|---:|---:|---:|
+| baseline (sequential) | 1840 | 2704 | 1768 / 3110 | 14/14 | 5/16 | 8/16 |
+| original rules | 1896 | 2659 | 505 / 795 | 2/14 | 4/16 | 6/16 |
+| `min=12` | 1720 | 2533 | 253 / 397 | 1/14 | 6/16 | 8/16 |
+| `min=0` | **724** | 1966 | 1234 / 1380 | 7/16 | 10/16 | 12/16 |
+| `min=18` / `24` / `32` | 1763 / 1963 / 1965 | 2503 / 2810 / 2761 | ≤425 worst | 1/14 each | — | — |
+| cap 16/30 | 1106 | 1303 | 651 / 1227 | 2/16 | 12/16 | 16/16 |
+| **cap 16/30 + backtracking** | **1043** | **1246** | 562 / 1010 | 2/16 | **12/16** | **16/16** |
+| cap 16/34 + backtracking | 1167 | 1565 | 682 / 1238 | 2/16 | 8/16 | 16/16 |
+
+Why a threshold alone is not enough: many replies open with a 60 to 110 character sentence
+that contains no punctuation, so no `min` finds a break. `min=0` is fast but leaves a hole in
+7 of 16 replies (`Sure!` then a 77 character sentence). The fix is an **opt-in cap**
+(`first_clause_max`): if the first clause reaches the cap with no punctuation, end it at the
+next word boundary. A token that starts with a space marks a finished word, so a clause is
+never cut inside a word (tested with sub-word pieces).
+
+A plain cap makes some poor cuts (`...a beloved stimulant that | energizes`,
+`...as active and | curious`). **Backtracking** fixes the common case: when the cap lands
+right after a function word (`that`, `and`, `the`, `of`...), the cut moves back before it and
+the word is carried into the next clause (`...a beloved stimulant | that energizes`). The
+opener gets shorter, not longer. It is bounded by a floor so the opener cannot collapse, and
+a property test checks that **no text is ever lost or duplicated** across 12 min/cap
+combinations. It cannot fix `personal | preferences` (adjective-noun); no word list can.
+
+Shipped default: `chunker: first_clause_min_chars: 16, first_clause_max_chars: 30`, in
+`settings.yaml`. Set `first_clause_max_chars: null` to remove all mid-sentence seams; the
+cost is p50 back to ~1700 ms.
+
+---
+
+## 28. The real player added ~200 ms of silence per clip, invisible to every benchmark (16)
+
+`NullPlayer` models when a clip starts and ends. The real `AudioPlayer` also calls
+`sd.play(blocking=True)` once per clip, and Windows' default host API here is **MME**.
+Measured with silent clips through the real device:
+
+```text
+legacy sd.play    8 plays of a 0.5 s clip: overhead min 197 | median 201 | max 214 ms per clip
+```
+
+So the gap numbers in §26 and §27 understated what a listener would have heard by roughly
+200 ms per clause boundary, and the cap deliberately creates more boundaries. Stream latency
+by host API, same machine:
+
+```text
+MME      93.3 ms
+WASAPI   24.8 ms   (fails outright at 24 kHz: "Invalid sample rate [-9997]" unless auto_convert=True)
+```
+
+`StreamingAudioPlayer` keeps one output stream open; its callback drains a queue, so a clip
+queued while the previous one plays follows it sample for sample. WASAPI shared mode with
+`auto_convert` is preferred on Windows, falling back to the default device. `play()` returns
+`lead_s` (50 ms) **before** its clip ends so the next clip can be queued in time; `drain()`
+waits for the real end. `NullPlayer` models both, so benchmarks stay faithful. The legacy
+player remains behind `audio.streaming_output: false` because this change cannot be
+verified by ear from here.
+
+Real-device check, 6 silent 0.5 s clips:
+
+```text
+legacy sd.play        wall 4.210 s   dead air 202 ms per clip
+streaming (WASAPI)    wall 2.998 s   dead air   0 ms per clip   (stream latency 25 ms)
+```
+
+Measured but not yet fixed: the default Windows output is currently **Speakers**, not
+headphones. Windows changes the default when devices are plugged in. With the AEC stub this
+means the agent can hear itself (README section 24).
+
+---
+
+## 29. Tests, and two that could not fail (and now can)
+
+`tests/` did not exist. It now has 59 passing tests and 2 strict xfails: chunker behaviour
+(including a decimal `3.5` and a clock time `10:30`, both split mid-number today and recorded
+as strict xfails), the pipelined `_respond` against fake components, the streaming player
+against a fake device thread that calls the real callback, and `NullPlayer`.
+
+I checked that the tests could actually fail, by running the defect through them:
+
+- The old **sequential** loop through the overlap test: wall 1.68 s and gaps of 156 ms against
+  thresholds of 1.55 s and 60 ms, so the test fails it. The pipelined loop gets 1.39 s and 0 ms.
+- The **gapless-player** test passed even with `lead_s=0`, so it proved nothing about the
+  lead. Both test clips were exactly 15 blocks long, so the first always ended on a block
+  boundary. With block-unaligned clips, `lead_s=0` inserts 440 samples (18 ms) of silence and
+  the test now fails it; `lead_s=0.05` inserts 0.
+- One assertion (`span[~(span != 0)] == 0`) selected the zeros and checked they were zeros. It
+  is replaced with a check on the samples between the two clips.
+
+---
+
+## 30. Final numbers
+
+Shipped defaults, `scripts/bench_latency.py --label 6-final-defaults`, 16 turns, simulated
+playback that models the streaming player:
+
+```text
+first syllable : p50 1062 ms | p95 1275 ms | min 843 | max 1301     PASS (1200 / 1800)
+silence        : median 0 ms | 4 turns with a 167-190 ms pause | 2 turns ~1 s (see below)
+stage cost     : first token 33 ms, chunker 181 ms, first-clause synthesis 847 ms (medians)
+```
+
+One real turn through the real streaming player on the real device (typed input):
+
+```text
+first audible syllable 1095 ms (2605 ms at the start of this session)
+silence between clauses [0, 0] ms
+```
+
+---
+
+## 31. Caveats that decide how far to trust §30
+
+* **Typed input.** Speech-to-text time is **not included**. Real voice-mode first syllable is
+  these numbers **plus Whisper's time**, which has never been measured on real speech.
+  README's estimate (~100 ms for a 3 s utterance) would put p50 near 1160 ms, which is
+  borderline against 1200. The targets are met for the pipeline from transcript onward, not
+  yet end to end from the microphone.
+* **Nobody has listened to it.** The mid-sentence seams of the cap and the new output path are
+  judged by ear, and I cannot. `first_clause_max_chars: null` and `audio.streaming_output:
+  false` revert them.
+* **Eight prompts, two repetitions of the same seeded replies.** The repetitions measure
+  timing noise only. Differences of a few percent between configurations are not evidence.
+* **One machine**, one CPU, one output device, WASAPI at 25 ms. Stream latency is not included
+  in "first syllable" (the stamp is taken as audio is handed to the player).
+* **Remaining silence.** A reply whose later clause is a long unpunctuated run-on (the "sky is
+  blue" reply: 150 characters) still pauses ~1 s before it, because the cap only governs the
+  first clause. A cap on later clauses relative to the previous one's length would address it.
+
+---
+
+## 32. Corrections to what I told you earlier
+
+* **Kokoro's real-time factor is 0.36 (fp32), not ~0.25 (int8).** README sections 4.1 and 8
+  carried the wrong figure and the wrong model.
+* **"152 ms of phonemizing on every clause" was wrong.** It is a one-time ~141 ms start-up (espeak
+  loading its data); afterwards 0.2 ms per call. `KokoroTTS` already warms it at load. I had
+  also logged it as a task (M8.6). The actual floor is ~440 ms inside the neural network.
+* **"ORT_DISABLE_ALL is ~10% faster" was noise** from one reading each. Eight interleaved
+  rounds: +0.2% overall, wins split 4/8, 4/8, 3/8. Not adopted.
+* **Gap numbers before §28 understated real silence by ~200 ms per boundary.**
+
+---
+
+## 33. Outstanding after Part 4
+
+* **Listen to it.** Mid-sentence seams, the new output path, and whether the pauses sound
+  natural. Needs you, on headphones.
+* **Voice path end to end:** real speech through the microphone and Whisper (M3, M4, M7).
+* **Barge-in** (M8.7), which now has the right primitive (`stop_immediately()` flushes the
+  stream) but no trigger, and real AEC (M3.3).
+* **Long run-on clauses** still pause (§31).
+* **Chunker splits decimals and clock times** (xfail tests); **phonemizer prints
+  `words count mismatch on 100.0% of the lines`** for some clauses, not yet investigated.
+* **Uncommitted:** everything in this part. README sections 4.1 and 8 still carry the old
+  Kokoro figures; the Word reference and the architecture page still show Edge-TTS.

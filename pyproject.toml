@@ -25,13 +25,14 @@ llm = ["llama-cpp-python"]
 # pydub decodes Edge-TTS mp3 to PCM and shells out to ffmpeg, which must be on PATH.
 # pydub needs stdlib `audioop`, removed in Python 3.13 - do not move past 3.12 without
 # replacing it (soundfile + av are the drop-in route).
-tts = ["edge-tts", "pydub"]
+tts = ["edge-tts", "pydub", "kokoro-onnx"]
 dev = ["pytest", "pytest-asyncio"]
 all = [
     "faster-whisper",
     "llama-cpp-python",
     "edge-tts",
     "pydub",
+    "kokoro-onnx",
     "pytest",
     "pytest-asyncio",
 ]

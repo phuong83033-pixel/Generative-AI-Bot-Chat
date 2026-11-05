@@ -13,6 +13,10 @@ class AudioConfig:
     output_sample_rate: int
     input_device: Optional[str] = None
     output_device: Optional[str] = None
+    # One persistent WASAPI output stream (gapless, ~25 ms latency) instead of an
+    # sd.play() per clip (~200 ms of silence per clause boundary). Set false to fall
+    # back to the legacy player if the streaming one misbehaves on a given machine.
+    streaming_output: bool = True
 
 @dataclass(frozen=True)
 class VadConfig:
@@ -45,6 +49,19 @@ class TtsConfig:
     voice: str
     rate: str
     output_sample_rate: int
+    # Local Kokoro-82M (provider: kokoro). Defaulted so a settings.yaml that
+    # predates the local voice still loads; `rate` applies to Edge only.
+    #
+    # `voice` is the EDGE voice name and `kokoro_voice` the Kokoro one: the two
+    # providers use incompatible naming ("en-US-AriaNeural" vs "af_heart"), so
+    # sharing one field made switching provider fail on an unknown voice.
+    #
+    # fp32, not int8: on this CPU the int8 graph is ~3x slower (README 31.6).
+    model_path: str = "data/models/kokoro/kokoro-v1.0.onnx"
+    voices_path: str = "data/models/kokoro/voices-v1.0.bin"
+    kokoro_voice: str = "af_heart"
+    speed: float = 1.0
+    threads: int = 6  # measured optimum = physical cores; 12 hyperthreads was slower
 
 @dataclass(frozen=True)
 class LatencyTargets:
@@ -60,6 +77,16 @@ class PersonaConfig:
     system_prompt: str
 
 @dataclass(frozen=True)
+class ChunkerConfig:
+    # Minimum characters before the FIRST clause of a reply may break. None keeps
+    # the original rules for every clause. See ClauseChunker.__init__ for why this
+    # is a trade between first-sound latency and silence before the second clause.
+    first_clause_min_chars: Optional[int] = None
+    # Hard cap for the first clause: end it at a word boundary once it reaches this
+    # length even without punctuation. None = off (no mid-sentence seams).
+    first_clause_max_chars: Optional[int] = None
+
+@dataclass(frozen=True)
 class AmadeusConfig:
     audio: AudioConfig
     vad: VadConfig
@@ -69,6 +96,7 @@ class AmadeusConfig:
     latency_targets: LatencyTargets
     persona: PersonaConfig
     log_level: str = "INFO"
+    chunker: ChunkerConfig = field(default_factory=ChunkerConfig)
 
 def load_config(config_dir: Optional[Path] = None) -> AmadeusConfig:
     if config_dir is None:
@@ -95,7 +123,8 @@ def load_config(config_dir: Optional[Path] = None) -> AmadeusConfig:
             chunk_size=settings["audio"]["chunk_size"],
             output_sample_rate=settings["audio"]["output_sample_rate"],
             input_device=input_device if input_device else None,
-            output_device=output_device if output_device else None
+            output_device=output_device if output_device else None,
+            streaming_output=settings["audio"].get("streaming_output", True),
         ),
         vad=VadConfig(**settings["vad"]),
         stt=SttConfig(**settings["stt"]),
@@ -111,5 +140,6 @@ def load_config(config_dir: Optional[Path] = None) -> AmadeusConfig:
         tts=TtsConfig(**settings["tts"]),
         latency_targets=LatencyTargets(**settings["latency_targets"]),
         persona=PersonaConfig(**persona_data),
-        log_level=log_level
+        log_level=log_level,
+        chunker=ChunkerConfig(**(settings.get("chunker") or {})),
     )

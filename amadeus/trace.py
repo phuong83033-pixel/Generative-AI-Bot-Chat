@@ -123,6 +123,11 @@ class TurnTrace:
         self.turn_id = turn_id
         self._stamps: Dict[str, float] = {}
         self._tracer = get_tracer("turn")
+        # Silence between consecutive clauses, in ms. A short first clause lowers
+        # first-syllable latency but can leave a hole while the next clause is
+        # still synthesising; tuning the first number without watching this one
+        # just trades latency for stutter.
+        self.gaps_ms: List[float] = []
 
     def stamp(self, stage: str) -> float:
         """Record the current time against a stage name. Returns ms since speech_end."""
@@ -143,6 +148,14 @@ class TurnTrace:
     def first_syllable_ms(self) -> Optional[float]:
         """End of user speech to first audible output. The headline metric."""
         return self.elapsed_ms("speech_end", "first_audio_out")
+
+    def add_gap(self, ms: float) -> None:
+        """Record audible silence between the end of one clause and the next."""
+        self.gaps_ms.append(max(0.0, ms))
+
+    @property
+    def max_gap_ms(self) -> float:
+        return max(self.gaps_ms) if self.gaps_ms else 0.0
 
     def breakdown(self) -> Dict[str, float]:
         """Per-stage durations in ms, in canonical order, for stages reached."""
@@ -168,6 +181,8 @@ class TurnTrace:
                 else None
             ),
             "stages": self.breakdown(),
+            "gaps_ms": [round(g, 1) for g in self.gaps_ms],
+            "max_gap_ms": round(self.max_gap_ms, 1),
         }
 
     def log(self) -> None:
@@ -186,6 +201,9 @@ class TurnTrace:
             lines.append(f"    {label:<34}{ms:>8.0f} ms")
         if self.first_syllable_ms is not None:
             lines.append(f"    {'= first audible syllable':<34}{self.first_syllable_ms:>8.0f} ms")
+        if self.gaps_ms:
+            shown = ", ".join(f"{g:.0f}" for g in self.gaps_ms)
+            lines.append(f"    {'silence between clauses':<34}{self.max_gap_ms:>8.0f} ms max  [{shown}]")
         return "\n".join(lines)
 
 

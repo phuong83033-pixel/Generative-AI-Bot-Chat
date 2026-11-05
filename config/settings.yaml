@@ -23,12 +23,30 @@ llm:
   top_p: 0.9
   repeat_penalty: 1.1
 tts:
-  provider: edge
+  provider: kokoro            # "kokoro" = local CPU, offline. "edge" = cloud fallback.
+  output_sample_rate: 24000
+  # --- local Kokoro-82M ---
+  model_path: data/models/kokoro/kokoro-v1.0.onnx   # fp32. NOT the int8 file: ~3x slower on CPU.
+  voices_path: data/models/kokoro/voices-v1.0.bin
+  kokoro_voice: af_heart
+  speed: 1.0
+  threads: 6                  # physical cores; measured faster than 12 hyperthreads
+  # --- Edge-TTS (used only when provider: edge) ---
   voice: en-US-AriaNeural
   rate: "+0%"
-  output_sample_rate: 24000
 latency_targets:
   first_syllable_p50_ms: 1200
   first_syllable_p95_ms: 1800
   barge_in_ms: 150
   peak_vram_gb: 3.6
+chunker:
+  # How the FIRST clause of a reply is cut. Measured on this CPU (scripts/bench_latency.py,
+  # 16 identical seeded replies): original rules p50 1896 ms / p95 2659 -> these values
+  # p50 1043 ms / p95 1246, every turn under 1800 ms.
+  #
+  # Kokoro costs ~440 ms fixed + ~19 ms per character, so the opener must be short to be
+  # heard quickly, but long enough (~19+ chars) to still be playing when clause 2 finishes
+  # synthesising. 16..30 is that window.
+  first_clause_min_chars: 16   # break at the first punctuation once this long
+  first_clause_max_chars: 30   # no punctuation by here? cut at a word boundary (set to null to
+                               # turn off: no mid-sentence seams, but p50 rises to ~1700 ms)

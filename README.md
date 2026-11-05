@@ -284,12 +284,12 @@ The system needs continuous awareness for natural interruption and full-duplex i
 
 The architecture is designed around the following target measurements:
 
-| Metric | Target | Measured (2026-10-07) |
+| Metric | Target | Measured (2026-11-04) |
 |---|---:|---:|
-| First audible syllable p50 | ≤ 1200 ms | not yet - needs `main.py` |
+| First audible syllable p50 | ≤ 1200 ms | **1062 ms** PASS (typed input, excludes speech-to-text, see 38.4) |
 | Optimized first syllable | ~900 ms | — |
-| First audible syllable p95 | ≤ 1800 ms | not yet |
-| Optimized p95 | ~1300 ms | — |
+| First audible syllable p95 | ≤ 1800 ms | **1275 ms** PASS (same caveat) |
+| Optimized p95 | ~1300 ms | 1275 ms |
 | Barge-in reaction | ≤ 150 ms | not yet |
 | Backchannel | ≤ 300 ms | — |
 | Sustained LLM decoding | ≥ 25 tok/s | **41.6 tok/s** PASS |
@@ -298,11 +298,16 @@ The architecture is designed around the following target measurements:
 
 These measurements should be treated as engineering requirements rather than optional optimizations.
 
-End-to-end latency cannot be measured until `amadeus/main.py` exists. The two
-numbers that *are* measured both pass, and decode throughput has useful margin:
-41.6 tok/s against conversational speech of roughly 4 tok/s means the LLM is
-about 10x faster than the mouth it feeds, so the clause chunker will never
-starve. See section 31 for the full measurement record and method.
+Decode throughput has useful margin: 41.6 tok/s against conversational speech of
+roughly 4 tok/s means the LLM is about 10x faster than the mouth it feeds, so the
+clause chunker will never starve.
+
+**First-syllable numbers are for typed input.** They start the clock at the end of
+the transcript, so they exclude Whisper, which has not yet been timed on real speech.
+Voice mode will be slower by Whisper's time, which would put p50 near the 1200 ms
+limit rather than comfortably under it. They also assume the first-clause cap in
+section 38 is enabled (it puts a seam mid-sentence; nobody has listened to it yet).
+Without the cap p50 is about 1700 ms. See sections 31 and 38 for method and record.
 
 ---
 
@@ -320,7 +325,7 @@ The planned Tier A stack is approximately:
 | VAD | Silero VAD CPU | CPU | CPU |
 | AEC | WebRTC AEC3 CPU | CPU | CPU |
 | Backchannel | CPU | CPU | CPU |
-| TTS | Kokoro-82M int8 CPU | CPU | CPU |
+| TTS | Kokoro-82M **fp32** CPU (int8 is 3x slower, see 38.1) | CPU | CPU, **+0 MB VRAM**, ~310 MB RAM |
 | Embeddings | multilingual-e5-small CPU | CPU | CPU |
 | Avatar | VTube Studio / iGPU | iGPU | iGPU |
 | **Peak** | both GPU models resident | ~3.45 GB | **3398 MB** |
@@ -410,7 +415,7 @@ CPU
 
 TTS:
 Kokoro-82M
-int8
+fp32 (NOT int8: ~3x slower on this CPU)
 CPU
 
 Embeddings:
@@ -1500,13 +1505,14 @@ Raw results are written to `data/logs/bench_vram.json` on every run.
 ## 31.4 Still to measure
 
 ```text
-scripts/bench_latency.py     - needs main.py; stage-by-stage p50/p95
+scripts/bench_latency.py     - DONE 2026-11-04 (typed input; results in section 38)
 scripts/bench_aec.py         - needs real AEC; echo return loss
 ```
 
 Whisper transcription latency was not isolated in this pass — the benchmark only
-forces a dummy decode so CTranslate2 allocates. Real STT timing belongs in
-`bench_latency.py`, against actual utterances.
+forces a dummy decode so CTranslate2 allocates. `bench_latency.py` drives typed
+input, so it also does not time Whisper: real STT timing still needs real
+utterances, and the first-syllable figures in section 38 exclude it.
 
 ## 31.5 An unprompted quality datapoint
 
@@ -1720,6 +1726,75 @@ LLM continues
 ```
 
 ---
+
+## 38.0 Status: built and measured (2026-11-04). Not verified by ear.
+
+What the roadmap diagram above turned into, in order of what mattered:
+
+1. **Pipelined `_respond`** - synthesis of clause N+1 overlaps playback of clause N.
+2. **First-clause policy** in the chunker - `first_clause_min_chars` / `first_clause_max_chars`.
+3. **A persistent output stream** - the legacy player added ~200 ms of silence per clip.
+
+All three were found and sized by measurement, not by design; the details, the sweep and the
+mistakes along the way are in `fix.md` Part 4. This section is the summary.
+
+## 38.1 Local voice: Kokoro, fp32
+
+Cloud TTS was 1909 ms of a 2605 ms first-sound latency. The planned local replacement
+(Kokoro int8) was **slower** than the cloud, 5.2 s to speak a 4 s sentence, because 83% of
+its runtime is one slow operator (`ConvInteger`). The fp32 model speaks the same sentence in
+~1.5 s (real-time factor 0.36, 6 threads), uses 0 MB of VRAM, and works offline. Cost model for
+this CPU: **~440 ms fixed + ~19 ms per character**, against speech at ~15 characters per second.
+
+## 38.2 What the numbers say
+
+Baseline (sequential playback, original chunker): first sound p50 1840 / p95 2704 ms, and the
+listener heard a pause of a second or more inside 14 of 14 multi-clause replies (worst 3.1 s).
+
+| Config (16 turns, identical seeded replies) | p50 | p95 | worst silence | turns with a >300 ms pause |
+|---|---:|---:|---:|---:|
+| sequential baseline | 1840 | 2704 | 3110 | 14 of 14 |
+| pipelined, original rules | 1896 | 2659 | 795 | 2 of 14 |
+| pipelined, `min=0` (fastest, no cap) | 724 | 1966 | 1380 | 7 of 16 |
+| **pipelined, min 16 / max 30 + backtracking (default)** | **1043** | **1246** | 1010 | 2 of 16 |
+
+Pipelining removes the stutter but cannot speed the first clause. The first clause's
+synthesis time sets first sound, and many replies open with a 60 to 110 character sentence
+with no comma, so no minimum length finds a break. The window that satisfies both limits is
+an opener of about **19 to 35 characters**: long enough to still be playing when clause 2 is
+ready, short enough to synthesise in time. A cap that ends the first clause at a word boundary
+reaches it.
+
+## 38.3 The cap and its seams (a quality trade you must judge by ear)
+
+If the first clause reaches 30 characters with no punctuation, it is cut at the next word
+boundary. Each clause is synthesised as its own utterance, so the voice falls and resets at the
+join. To keep seams on phrase boundaries, a cut that would land after a function word
+(`that`, `and`, `the`, `of`...) moves back before it: `a beloved stimulant | that energizes`
+rather than `a beloved stimulant that | energizes`. It cannot fix adjective-noun splits
+(`personal | preferences`). Turn it off with `first_clause_max_chars: null`; p50 then returns
+to about 1700 ms.
+
+## 38.4 Honest limits
+
+* **Typed input only.** Whisper time is not in the 1062 ms.
+* **Not listened to.** The seams and the new output path are unjudged.
+* **Long run-on clauses still pause ~1 s** (a 150 character unpunctuated clause 3). The cap only
+  governs the first clause.
+* Eight prompts, same replies repeated: small differences between configs are noise.
+
+## 38.5 The output path
+
+`sd.play()` per clip costs ~202 ms of dead air each on this machine (Windows MME host API).
+`StreamingAudioPlayer` holds one WASAPI shared-mode stream open (25 ms latency, 24 kHz needs
+`auto_convert`) and queues clips back to back: measured 202 ms -> 0 ms per clip on the real
+device. `audio.streaming_output: false` restores the legacy player.
+
+## 38.6 Tooling added
+
+`scripts/bench_latency.py` (`--first-min`, `--first-max`, `--seed`), `--mute` (silent run that
+waits out each clip's real duration, so timing stays valid), `NullPlayer`,
+`TurnTrace.add_gap`, and `tests/` (59 passing).
 
 # 39. M9 — Emotion
 

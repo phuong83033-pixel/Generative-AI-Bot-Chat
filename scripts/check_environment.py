@@ -233,6 +233,63 @@ def check_model_weights() -> None:
     result("Qwen2.5-3B GGUF", True, f"{size_mb:.0f} MB, valid GGUF header")
 
 
+# Exact sizes of the official kokoro-onnx `model-files-v1.0` release assets. An
+# exact match proves the download completed; a first int8 download here stopped at
+# 241,954 bytes with no error and would otherwise only fail when the model loaded.
+KOKORO_SIZES = {
+    "kokoro-v1.0.onnx": 325_532_387,
+    "kokoro-v1.0.int8.onnx": 92_361_271,
+    "voices-v1.0.bin": 28_214_398,
+}
+
+
+def check_kokoro() -> None:
+    """The default local voice. Skipped unless settings.yaml selects it."""
+    try:
+        import yaml
+
+        settings = yaml.safe_load((PROJECT_ROOT / "config" / "settings.yaml").read_text(encoding="utf-8"))
+        tts = (settings or {}).get("tts", {}) or {}
+    except Exception as e:
+        result("Kokoro voice files", False, f"could not read settings.yaml: {e}")
+        return
+
+    provider = str(tts.get("provider", "")).lower()
+    if provider != "kokoro":
+        result("Kokoro voice files", True, f"skipped (tts.provider is {provider!r})")
+        return
+
+    model_rel = tts.get("model_path", "data/models/kokoro/kokoro-v1.0.onnx")
+    voices_rel = tts.get("voices_path", "data/models/kokoro/voices-v1.0.bin")
+    problems: list[str] = []
+
+    for label, rel in (("model", model_rel), ("voices", voices_rel)):
+        path = PROJECT_ROOT / rel
+        if not path.is_file():
+            problems.append(f"{label} missing: {rel} (see run.md section 3.7)")
+            continue
+        expected = KOKORO_SIZES.get(path.name)
+        actual = path.stat().st_size
+        if expected is not None and actual != expected:
+            problems.append(f"{path.name} is {actual:,} bytes, expected {expected:,} - truncated download?")
+
+    if problems:
+        result("Kokoro voice files", False, "; ".join(problems))
+        return
+
+    if "int8" in Path(model_rel).name.lower():
+        result(
+            "Kokoro voice files",
+            False,
+            "int8 model selected: about 3x slower than fp32 on this CPU and slower than "
+            "real time. Use kokoro-v1.0.onnx (run.md section 3.7)",
+            warn=True,
+        )
+        return
+
+    result("Kokoro voice files", True, f"{Path(model_rel).name} + voices, sizes verified, fp32")
+
+
 def check_directories() -> None:
     for rel in ["data/models", "data/logs", "config"]:
         path = PROJECT_ROOT / rel
@@ -249,6 +306,7 @@ def main() -> int:
     check_ffmpeg()
     check_audio_devices()
     check_model_weights()
+    check_kokoro()
     check_directories()
 
     print()

@@ -42,7 +42,13 @@ class QwenProvider(LLMProvider):
                  max_tokens: int = 256,
                  top_p: float = 0.9,
                  repeat_penalty: float = 1.1,
-                 bus: EventBus | None = None):
+                 bus: EventBus | None = None,
+                 seed: int | None = None):
+        # Sampling seed. None (the default) leaves llama.cpp random, as in normal
+        # use. scripts/bench_latency.py sets it so every configuration under test
+        # receives identical replies - otherwise reply length and shape, which
+        # dominate first-sound time, would swamp the effect being measured.
+        self.seed = seed
         self._temperature = temperature
         self._max_tokens = max_tokens
         self._top_p = top_p
@@ -67,6 +73,7 @@ class QwenProvider(LLMProvider):
         
         def _generate():
             try:
+                extra = {} if self.seed is None else {"seed": self.seed}
                 response = self._model.create_chat_completion(
                     messages=messages,
                     stream=True,
@@ -74,6 +81,7 @@ class QwenProvider(LLMProvider):
                     max_tokens=self._max_tokens,
                     top_p=self._top_p,
                     repeat_penalty=self._repeat_penalty,
+                    **extra,
                 )
                 for chunk in response:
                     if stop and stop.is_set():

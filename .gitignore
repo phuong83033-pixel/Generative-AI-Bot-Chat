@@ -6,3 +6,5 @@ data/models/
 data/logs/
 amadeus_ai.egg-info/
 *.egg-info/
+.pytest_cache/
+~$*
