@@ -26,6 +26,7 @@ llm = ["llama-cpp-python"]
 # pydub needs stdlib `audioop`, removed in Python 3.13 - do not move past 3.12 without
 # replacing it (soundfile + av are the drop-in route).
 tts = ["edge-tts", "pydub", "kokoro-onnx"]
+avatar = ["aiohttp"]
 dev = ["pytest", "pytest-asyncio"]
 all = [
     "faster-whisper",
@@ -33,6 +34,7 @@ all = [
     "edge-tts",
     "pydub",
     "kokoro-onnx",
+    "aiohttp",
     "pytest",
     "pytest-asyncio",
 ]
@@ -45,3 +47,6 @@ amadeus = "amadeus.main:main"
 # ambiguity). Only the amadeus package is importable code.
 [tool.setuptools.packages.find]
 include = ["amadeus*"]
+
+[tool.setuptools.package-data]
+"amadeus.expression" = ["web/*.html"]

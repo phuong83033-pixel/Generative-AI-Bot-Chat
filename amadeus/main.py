@@ -64,9 +64,12 @@ _DONE = object()
 class Amadeus:
     """Owns every component and runs the turn loop."""
 
-    def __init__(self, cfg: AmadeusConfig, *, text_mode: bool = False, mute: bool = False):
+    def __init__(self, cfg: AmadeusConfig, *, text_mode: bool = False, mute: bool = False,
+                 avatar: bool = False):
         self.cfg = cfg
         self.text_mode = text_mode
+        # M14: an optional output layer. Either the CLI flag or avatar.enabled turns it on.
+        self.avatar = avatar or cfg.avatar.enabled
         # mute: play through NullPlayer, which waits out each clip's real duration
         # without making sound. Timing-faithful, so benchmarks stay valid.
         self.mute = mute
@@ -87,6 +90,9 @@ class Amadeus:
         self.chunker = None
         self.tts = None
         self.player = None
+        self.emotion = None          # M9
+        self._emotion_task = None
+        self.avatar_driver = None    # M14
 
     # ------------------------------------------------------------------ setup
 
@@ -137,6 +143,14 @@ class Amadeus:
         from amadeus.synthesis.chunker import ClauseChunker
 
         self.prompt = PromptBuilder(system_prompt=self.cfg.persona.system_prompt)
+
+        if self.cfg.emotion.enabled:
+            from amadeus.emotion.engine import EmotionEngine
+
+            self.emotion = EmotionEngine(self.cfg.emotion, bus=self.bus)
+            # Lets the mood fade while nobody is talking (the avatar watches it).
+            self._emotion_task = asyncio.create_task(self.emotion.run_ticker(self._shutdown))
+
         self.chunker = ClauseChunker(
             bus=self.bus,
             first_clause_min=self.cfg.chunker.first_clause_min_chars,
@@ -179,6 +193,9 @@ class Amadeus:
                 bus=self.bus,
             )
 
+        if self.avatar:
+            await self._start_avatar()
+
         if not self.text_mode:
             from amadeus.perception.aec import AECStub
             from amadeus.perception.audio_in import MicrophoneStream
@@ -215,6 +232,49 @@ class Amadeus:
         log_vram("all models resident")
         self.tracer.info("Setup complete.")
 
+    async def _start_avatar(self) -> None:
+        """Start the avatar renderers. Optional by design: if anything here fails the voice
+        assistant carries on without a face (README section 26: output layer, not core)."""
+        a = self.cfg.avatar
+        sinks = []
+        try:
+            if a.web:
+                from amadeus.expression.server import WebAvatarServer
+
+                web = WebAvatarServer(port=a.web_port)
+                try:
+                    await web.start()
+                    sinks.append(web)
+                    print(f"[avatar preview: {web.url}]", flush=True)
+                except RuntimeError as e:
+                    self.tracer.warning(str(e))
+            if a.vtube:
+                from amadeus.expression.vtube import VTubeStudioSink
+
+                vts = VTubeStudioSink(
+                    url=a.vtube_url,
+                    plugin_name=a.plugin_name,
+                    plugin_developer=a.plugin_developer,
+                    token_path=PROJECT_ROOT / a.vtube_token_path,
+                    hotkeys=a.vtube_hotkeys,
+                    invert=a.vtube_invert,
+                )
+                await vts.start()  # connects in the background; VTube Studio may not be running yet
+                sinks.append(vts)
+                print(f"[avatar: VTube Studio at {a.vtube_url} (click ALLOW in its popup on first run)]", flush=True)
+            if not sinks:
+                self.tracer.warning("Avatar requested but no renderer could start; continuing without it.")
+                return
+
+            from amadeus.expression.driver import AvatarDriver
+
+            self.avatar_driver = AvatarDriver(
+                self.bus, sinks, level_source=lambda: self.player.level, fps=a.fps
+            )
+            await self.avatar_driver.start()
+        except Exception:
+            self.tracer.error("Avatar failed to start; continuing without it", exc_info=True)
+
     # ------------------------------------------------------------- perception
 
     async def _listen(self, trace: TurnTrace, stop: asyncio.Event) -> str | None:
@@ -227,6 +287,10 @@ class Amadeus:
             return text or None
 
         self.state.transition(SystemState.LISTENING)
+        # Discard whatever was recorded while the agent was thinking or speaking.
+        dropped = self.mic.flush()
+        if dropped:
+            self.tracer.info(f"Discarded {dropped} stale mic chunks ({dropped * 32} ms) before listening")
         print("\n[listening ...]", flush=True)
 
         audio = await self.vad.listen_until_speech_ends(self.mic, stop)
@@ -262,7 +326,11 @@ class Amadeus:
         The queue holds one clip, so synthesis runs at most one clip ahead of
         playback. Deeper would waste CPU on audio that an interruption throws away.
         """
-        messages = self.prompt.build(user_text)
+        # M9: the mood colours both what she says and how fast she says it. Both are
+        # None / speed 1.0 while neutral, i.e. exactly the pre-emotion behaviour.
+        hint = self.emotion.prompt_hint() if self.emotion else None
+        style = self.emotion.tts_style() if self.emotion else None
+        messages = self.prompt.build(user_text, mood_hint=hint)
         trace.stamp("prompt_built")
 
         token_stream = self._tapped_tokens(self.brain.stream(messages, stop), trace)
@@ -277,7 +345,7 @@ class Amadeus:
                 if not trace.has("first_clause"):
                     trace.stamp("first_clause")
 
-                audio = await self.tts.synth(clause, stop)
+                audio = await self.tts.synth(clause, stop, style)
                 if not trace.has("tts_done"):
                     trace.stamp("tts_done")
 
@@ -365,6 +433,11 @@ class Amadeus:
         if self.text_mode:
             print(f"you > {user_text}")
 
+        if self.emotion is not None:
+            snap = await self.emotion.on_user_utterance(user_text)
+            style = self.emotion.tts_style()
+            print(f"[mood: {snap} | voice x{style.speed:.2f}]", flush=True)
+
         self.state.transition(SystemState.THINKING)
 
         try:
@@ -411,6 +484,11 @@ class Amadeus:
 
     async def shutdown(self) -> None:
         self.tracer.info("Shutting down ...")
+        self._shutdown.set()  # ends the emotion ticker
+        if self._emotion_task is not None:
+            await asyncio.gather(self._emotion_task, return_exceptions=True)
+        if self.avatar_driver is not None:
+            await self.avatar_driver.stop()
         if self.player is not None:
             self.player.stop_immediately()
             self.player.close()
@@ -447,6 +525,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="no sound: playback is simulated by waiting out each clip's duration",
     )
+    p.add_argument(
+        "--avatar",
+        action="store_true",
+        help="show the avatar (browser preview at http://127.0.0.1:8765/; see settings.yaml avatar:)",
+    )
     p.add_argument("--log-level", default=None, help="DEBUG, INFO, WARNING, ERROR")
     return p.parse_args(argv)
 
@@ -456,7 +539,7 @@ def main(argv: list[str] | None = None) -> int:
     cfg = load_config()
     setup_logging(args.log_level or cfg.log_level, log_dir=PROJECT_ROOT / "data" / "logs")
 
-    app = Amadeus(cfg, text_mode=args.text, mute=args.mute)
+    app = Amadeus(cfg, text_mode=args.text, mute=args.mute, avatar=args.avatar)
     try:
         asyncio.run(app.run(max_turns=args.turns))
     except KeyboardInterrupt:

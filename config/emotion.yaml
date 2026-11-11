@@ -1,0 +1,34 @@
+# M9 - PAD emotion. Every value here is a hand-picked starting point, not a measurement.
+# Tune by talking to her and watching the "[mood ...]" line printed after each of your turns.
+enabled: true
+
+# Where the mood settles when nothing is happening: (P)leasure, (A)rousal, (D)ominance, each -1..1.
+# Slightly pleasant, calm, and confident (she is sure of herself).
+baseline:
+  pleasure: 0.05
+  arousal: 0.05
+  dominance: 0.25
+
+# Seconds for the distance from the baseline to HALVE. A compliment's arousal (45 s) is gone
+# in a couple of minutes; her confidence (120 s) returns more slowly than her excitement.
+half_life_s:
+  pleasure: 90
+  arousal: 45
+  dominance: 120
+
+# Multiplies every appraisal delta. 0 = emotion never changes; 2 = twice as reactive.
+appraisal_strength: 1.0
+
+# A mood fainter than this adds nothing to the LLM prompt (0..1).
+hint_min_intensity: 0.25
+
+# How often the mood is re-evaluated while nobody is talking, so the avatar sees it fade.
+tick_interval_s: 1.0
+
+# Voice speed = 1 + speed_per_arousal * (arousal - baseline) + speed_per_pleasure * (pleasure - baseline),
+# clamped. Kokoro can only change speed, not pitch or energy.
+tts:
+  speed_per_arousal: 0.10
+  speed_per_pleasure: 0.04
+  speed_min: 0.90
+  speed_max: 1.12

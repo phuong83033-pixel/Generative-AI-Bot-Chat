@@ -92,6 +92,12 @@ class AudioPlayer:
     def is_playing(self) -> bool:
         return self._playing
 
+    @property
+    def level(self) -> float:
+        """Always 0: sd.play() exposes no per-block hook, so the legacy player cannot drive
+        lip-sync. Use the streaming player (audio.streaming_output: true) for the avatar."""
+        return 0.0
+
     def stop_immediately(self) -> None:
         """Stop any current playback immediately."""
         sd.stop()
@@ -149,10 +155,21 @@ class StreamingAudioPlayer:
         self._played_frames = 0     # frames the callback has consumed
         self._waiters: list[tuple[int, asyncio.Future, asyncio.AbstractEventLoop]] = []
         self._stream = None
+        self._level = 0.0           # RMS of the last block handed to the device (see `level`)
 
     @property
     def lead_s(self) -> float:
         return self._lead_s
+
+    @property
+    def level(self) -> float:
+        """Loudness (RMS, full scale = 1.0) of the audio most recently sent to the speakers.
+
+        Measured in the output callback, so it is what is being played, not what was queued
+        (the lip-sync of the avatar, M14, follows it). A float assignment is atomic in CPython,
+        so readers on the event loop need no lock. 0.0 during silence and between clips.
+        """
+        return self._level
 
     # ------------------------------------------------------------------ device
 
@@ -229,6 +246,7 @@ class StreamingAudioPlayer:
             if n < frames:
                 outdata[n:, 0] = 0.0  # underrun between clips is silence, not noise
             self._played_frames += n
+            self._level = float(np.sqrt(np.mean(np.square(outdata[:frames, 0])))) if n else 0.0
 
             if self._waiters:
                 still = []
@@ -313,6 +331,7 @@ class StreamingAudioPlayer:
             self._queue.clear()
             self._offset = 0
             self._played_frames = self._queued_frames
+            self._level = 0.0
             waiters, self._waiters = self._waiters, []
         for _, fut, loop in waiters:
             self._release(fut, loop)
@@ -350,10 +369,28 @@ class NullPlayer:
         self._bus = bus
         self._lead_s = lead_s
         self._busy_until = 0.0  # time.monotonic() when the queued audio ends
+        # (start, end, audio) of every clip still to be "heard", for the simulated level.
+        self._segments: list[tuple[float, float, np.ndarray]] = []
 
     @property
     def lead_s(self) -> float:
         return self._lead_s
+
+    @property
+    def level(self) -> float:
+        """Simulated loudness: RMS of the 20 ms of the clip that WOULD be playing right now.
+
+        Lets the avatar be exercised with --mute, where nothing reaches a speaker.
+        """
+        now = time.monotonic()
+        self._segments = [seg for seg in self._segments if seg[1] > now]
+        for start, end, audio in self._segments:
+            if start <= now < end:
+                i = int((now - start) * self._sample_rate)
+                window = audio[i:i + int(0.02 * self._sample_rate)]
+                if window.size:
+                    return float(np.sqrt(np.mean(np.square(window))))
+        return 0.0
 
     async def _sleep_until(self, t: float, stop: asyncio.Event | None) -> None:
         timeout = max(0.0, t - time.monotonic())
@@ -373,6 +410,7 @@ class NullPlayer:
         now = time.monotonic()
         start = max(now, self._busy_until)
         self._busy_until = start + audio.size / self._sample_rate
+        self._segments.append((start, self._busy_until, np.asarray(audio, dtype=np.float32)))
         await self._sleep_until(self._busy_until - self._lead_s, stop)
 
     async def drain(self, stop: asyncio.Event | None = None) -> None:
@@ -384,6 +422,7 @@ class NullPlayer:
 
     def stop_immediately(self) -> None:
         self._busy_until = 0.0
+        self._segments.clear()
 
     def close(self) -> None:
         pass

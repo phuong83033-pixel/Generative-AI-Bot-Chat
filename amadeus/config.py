@@ -87,6 +87,46 @@ class ChunkerConfig:
     first_clause_max_chars: Optional[int] = None
 
 @dataclass(frozen=True)
+class EmotionConfig:
+    """M9. Every default is the value shipped in config/emotion.yaml, so a missing file
+    behaves identically to the shipped one."""
+    enabled: bool = True
+    # Personality baseline the mood relaxes toward: (pleasure, arousal, dominance).
+    # Slightly pleasant, calm, and confident: she is sure of herself.
+    baseline: tuple = (0.05, 0.05, 0.25)
+    # Seconds for the distance to the baseline to halve, per axis (P, A, D).
+    half_life_s: tuple = (90.0, 45.0, 120.0)
+    appraisal_strength: float = 1.0
+    # Moods fainter than this add nothing to the prompt.
+    hint_min_intensity: float = 0.25
+    tick_interval_s: float = 1.0
+    # Voice speed = 1 + speed_per_arousal * ΔA + speed_per_pleasure * ΔP (Δ from baseline).
+    speed_per_arousal: float = 0.10
+    speed_per_pleasure: float = 0.04
+    speed_min: float = 0.90
+    speed_max: float = 1.12
+
+@dataclass(frozen=True)
+class AvatarConfig:
+    """M14. Off by default: the avatar is an optional output layer (README section 26)."""
+    enabled: bool = False
+    fps: int = 30
+    # Built-in browser preview. Needs no Live2D model and no VTube Studio.
+    web: bool = True
+    web_port: int = 8765
+    # VTube Studio (needs the app running with a model loaded and its API enabled).
+    vtube: bool = False
+    vtube_url: str = "ws://127.0.0.1:8001"
+    plugin_name: str = "Amadeus"
+    plugin_developer: str = "Amadeus project"
+    # emotion label -> name of a VTube Studio hotkey (an expression toggle in the model).
+    vtube_hotkeys: Dict[str, str] = field(default_factory=dict)
+    # Where the access token VTube Studio issues is kept (git-ignored; delete it to re-pair).
+    vtube_token_path: str = "data/vtube_token.txt"
+    # Parameter names whose direction is backwards for a given model, e.g. ["FaceAngleY"].
+    vtube_invert: List[str] = field(default_factory=list)
+
+@dataclass(frozen=True)
 class AmadeusConfig:
     audio: AudioConfig
     vad: VadConfig
@@ -97,6 +137,41 @@ class AmadeusConfig:
     persona: PersonaConfig
     log_level: str = "INFO"
     chunker: ChunkerConfig = field(default_factory=ChunkerConfig)
+    emotion: EmotionConfig = field(default_factory=EmotionConfig)
+    avatar: AvatarConfig = field(default_factory=AvatarConfig)
+
+
+def _load_emotion(config_dir: Path) -> EmotionConfig:
+    """config/emotion.yaml is optional; absent means the defaults above."""
+    path = config_dir / "emotion.yaml"
+    if not path.is_file():
+        return EmotionConfig()
+    with open(path, "r", encoding="utf-8") as f:
+        d = yaml.safe_load(f) or {}
+    base = d.get("baseline") or {}
+    half = d.get("half_life_s") or {}
+    tts = d.get("tts") or {}
+    default = EmotionConfig()
+    return EmotionConfig(
+        enabled=d.get("enabled", default.enabled),
+        baseline=(
+            float(base.get("pleasure", default.baseline[0])),
+            float(base.get("arousal", default.baseline[1])),
+            float(base.get("dominance", default.baseline[2])),
+        ),
+        half_life_s=(
+            float(half.get("pleasure", default.half_life_s[0])),
+            float(half.get("arousal", default.half_life_s[1])),
+            float(half.get("dominance", default.half_life_s[2])),
+        ),
+        appraisal_strength=float(d.get("appraisal_strength", default.appraisal_strength)),
+        hint_min_intensity=float(d.get("hint_min_intensity", default.hint_min_intensity)),
+        tick_interval_s=float(d.get("tick_interval_s", default.tick_interval_s)),
+        speed_per_arousal=float(tts.get("speed_per_arousal", default.speed_per_arousal)),
+        speed_per_pleasure=float(tts.get("speed_per_pleasure", default.speed_per_pleasure)),
+        speed_min=float(tts.get("speed_min", default.speed_min)),
+        speed_max=float(tts.get("speed_max", default.speed_max)),
+    )
 
 def load_config(config_dir: Optional[Path] = None) -> AmadeusConfig:
     if config_dir is None:
@@ -142,4 +217,6 @@ def load_config(config_dir: Optional[Path] = None) -> AmadeusConfig:
         persona=PersonaConfig(**persona_data),
         log_level=log_level,
         chunker=ChunkerConfig(**(settings.get("chunker") or {})),
+        emotion=_load_emotion(config_dir),
+        avatar=AvatarConfig(**(settings.get("avatar") or {})),
     )

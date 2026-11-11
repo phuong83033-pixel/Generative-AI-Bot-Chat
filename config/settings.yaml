@@ -12,7 +12,8 @@ vad:
 stt:
   model_size: small
   compute_type: int8_float16
-  language: null
+  language: en   # fixed. Auto-detect cost ~120 ms per utterance (measured) and was unreliable on
+                 # short phrases (confidence < 0.7 on 5 of 12 live turns). The persona and voice are English.
   device: cuda
 llm:
   model_path: data/models/qwen2.5-3b-instruct-q4_k_m.gguf
@@ -50,3 +51,16 @@ chunker:
   first_clause_min_chars: 16   # break at the first punctuation once this long
   first_clause_max_chars: 30   # no punctuation by here? cut at a word boundary (set to null to
                                # turn off: no mid-sentence seams, but p50 rises to ~1700 ms)
+
+avatar:
+  # M14. Off by default; `python -m amadeus.main --avatar` turns it on for one run.
+  enabled: false
+  fps: 30
+  web: true                  # built-in browser preview at http://127.0.0.1:<web_port>/ (no model needed)
+  web_port: 8765
+  vtube: false               # drive a Live2D model in VTube Studio (needs its API enabled + a model loaded)
+  vtube_url: ws://127.0.0.1:8001
+  # vtube_hotkeys:           # emotion label -> VTube Studio hotkey name (expression toggles in the model)
+  #   flustered: Blush
+  #   annoyed: Angry
+  # vtube_invert: [FaceAngleY]   # list a parameter here if the model moves it the wrong way

@@ -48,9 +48,11 @@ class FakeTTS(TTSProvider):
     def __init__(self, synth_s, audio_s, fail_on=None):
         self.synth_s, self.audio_s, self.fail_on = synth_s, audio_s, fail_on
         self.calls = []
+        self.styles = []
 
-    async def synth(self, text, stop=None):
+    async def synth(self, text, stop=None, style=None):
         self.calls.append(text)
+        self.styles.append(style)
         if self.fail_on is not None and len(self.calls) == self.fail_on:
             raise RuntimeError("synth exploded")
         await asyncio.sleep(self.synth_s)
@@ -62,7 +64,8 @@ class FakeTTS(TTSProvider):
 
 
 class FakePrompt:
-    def build(self, user_input=None):
+    def build(self, user_input=None, mood_hint=None):
+        self.last_mood_hint = mood_hint
         return [{"role": "user", "content": user_input}]
 
 
@@ -178,7 +181,7 @@ def test_stop_mid_reply_ends_promptly():
 
 def test_empty_audio_is_skipped_not_fatal():
     class SilentTTS(FakeTTS):
-        async def synth(self, text, stop=None):
+        async def synth(self, text, stop=None, style=None):
             self.calls.append(text)
             return np.array([], dtype=np.float32)
 

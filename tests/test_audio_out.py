@@ -245,3 +245,67 @@ def test_null_player_stop_cuts_playback_short():
         return time.perf_counter() - t0
 
     assert run(go()) < 0.4
+
+
+# ------------------------------------------------- level (lip-sync source, M14)
+
+def test_level_is_zero_before_anything_plays(player):
+    assert player.level == 0.0
+
+
+def test_level_is_the_loudness_of_what_is_actually_playing(player):
+    async def go():
+        # play() returns lead_s BEFORE the clip ends, so sample while it is still playing.
+        task = asyncio.create_task(player.play(np.full(int(SR * 0.5), 0.3, dtype=np.float32)))
+        await asyncio.sleep(0.2)
+        during = player.level
+        await task
+        await player.drain()
+        await asyncio.sleep(0.1)                                           # a couple of silent blocks
+        return during, player.level
+
+    during, after = run(go())
+    assert during == pytest.approx(0.3, abs=0.01)
+    assert after == 0.0
+
+
+def test_level_drops_to_zero_at_once_when_playback_is_cut():
+    async def go():
+        with pytest.MonkeyPatch.context() as mp:
+            FakeStream.instances.clear()
+            mp.setattr(audio_out.sd, "OutputStream", FakeStream)
+            mp.setattr(audio_out.sd, "query_hostapis", lambda: [])
+            mp.setattr(audio_out.sd, "query_devices", lambda *a, **k: {"name": "fake"})
+            p = StreamingAudioPlayer(sample_rate=SR)
+            try:
+                task = asyncio.create_task(p.play(np.full(int(SR * 2), 0.3, dtype=np.float32)))
+                await asyncio.sleep(0.15)
+                loud = p.level
+                p.stop_immediately()
+                return loud, p.level
+            finally:
+                p.close()
+
+    loud, cut = run(go())
+    assert loud > 0.2 and cut == 0.0
+
+
+def test_null_player_simulates_the_level_of_the_clip_that_would_be_playing():
+    async def go():
+        p = NullPlayer(sample_rate=SR)
+        before = p.level
+        task = asyncio.create_task(p.play(np.full(int(SR * 0.4), 0.3, dtype=np.float32)))
+        await asyncio.sleep(0.1)
+        during = p.level
+        await task
+        # asyncio's timer resolution on Windows is ~15 ms, so play() can return slightly BEFORE the
+        # simulated end of the clip. Allow for that: the level must be 0 shortly after, not at that instant.
+        await asyncio.sleep(0.06)
+        return before, during, p.level
+
+    before, during, after = run(go())
+    assert before == 0.0 and during == pytest.approx(0.3, abs=0.01) and after == 0.0
+
+
+def test_legacy_player_has_no_level():
+    assert audio_out.AudioPlayer().level == 0.0

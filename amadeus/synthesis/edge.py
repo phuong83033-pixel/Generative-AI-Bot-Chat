@@ -3,7 +3,7 @@ import io
 import numpy as np
 import edge_tts
 from pydub import AudioSegment
-from amadeus.synthesis.base import TTSProvider
+from amadeus.synthesis.base import TTSProvider, TtsStyle
 from amadeus.trace import get_tracer
 
 class EdgeTTS(TTSProvider):
@@ -21,8 +21,10 @@ class EdgeTTS(TTSProvider):
         self._tracer = get_tracer("edge_tts")
     
     async def synth(self, text: str,
-                    stop: asyncio.Event | None = None) -> np.ndarray:
-        """Synthesize speech using Edge TTS."""
+                    stop: asyncio.Event | None = None,
+                    style: TtsStyle | None = None) -> np.ndarray:
+        """Synthesize speech using Edge TTS. `style` is accepted and ignored: this is the
+        cloud fallback voice and is not emotion-driven."""
         self._tracer.info(f"Synthesizing text: {text[:50]}...")
         communicate = edge_tts.Communicate(text, self._voice, rate=self._rate)
         audio_bytes = b""

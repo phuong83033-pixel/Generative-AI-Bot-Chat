@@ -30,19 +30,28 @@ class PromptBuilder:
         self._history.append(DialogueTurn(role="assistant", content=text))
         self._trim_history()
     
-    def build(self, user_input: str | None = None) -> list[dict]:
+    def build(self, user_input: str | None = None, mood_hint: str | None = None) -> list[dict]:
         """Build the message list for the LLM.
-        
+
         If user_input is provided, it's added as the latest user message.
-        
+
+        `mood_hint` (M9) is a one-line system message placed immediately BEFORE the latest
+        user message, in the volatile tail. The system prompt stays byte-identical from
+        turn to turn, so the prefix the LLM has already processed is reusable. It is not
+        stored in history: the mood is recomputed every turn, and a stale "you are angry"
+        must not survive into the next one.
+
         Returns:
             List of message dicts ready for chat completion.
         """
         messages = [{"role": "system", "content": self._system_prompt}]
-        
+
         for turn in self._history:
             messages.append({"role": turn.role, "content": turn.content})
-            
+
+        if mood_hint:
+            messages.append({"role": "system", "content": mood_hint})
+
         if user_input is not None:
             messages.append({"role": "user", "content": user_input})
             

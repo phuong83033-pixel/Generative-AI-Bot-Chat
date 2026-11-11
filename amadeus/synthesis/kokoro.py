@@ -48,7 +48,7 @@ from pathlib import Path
 
 import numpy as np
 
-from amadeus.synthesis.base import TTSProvider
+from amadeus.synthesis.base import TTSProvider, TtsStyle
 from amadeus.trace import get_tracer
 
 # Kokoro always renders at 24 kHz.
@@ -126,18 +126,24 @@ class KokoroTTS(TTSProvider):
             f"({len(available)} voices)"
         )
 
-    async def synth(self, text: str, stop: asyncio.Event | None = None) -> np.ndarray:
-        """Synthesize speech. Returns an empty array when cancelled or on error."""
+    async def synth(self, text: str, stop: asyncio.Event | None = None,
+                    style: TtsStyle | None = None) -> np.ndarray:
+        """Synthesize speech. Returns an empty array when cancelled or on error.
+
+        `style.speed` scales the configured speed (Kokoro's accepted range is 0.5-2.0).
+        """
         spoken = clean_for_speech(text)
         empty = np.array([], dtype=np.float32)
         if not spoken:
             return empty
         if stop is not None and stop.is_set():
             return empty
+        speed = self._speed * (style.speed if style is not None else 1.0)
+        speed = max(0.5, min(2.0, speed))
 
         def _run() -> np.ndarray:
             samples, _rate = self._kokoro.create(
-                spoken, voice=self._voice, speed=self._speed, lang=self._lang
+                spoken, voice=self._voice, speed=speed, lang=self._lang
             )
             return np.asarray(samples, dtype=np.float32)
 
