@@ -1798,27 +1798,69 @@ waits out each clip's real duration, so timing stays valid), `NullPlayer`,
 
 # 39. M9 — Emotion
 
-Implement:
+## 39.0 Status: built and tested (2026-11-10). Not judged by ear, and the prompt effect is small.
 
 ```text
-emotion/pad.py
-emotion/appraisal.py
-emotion/labels.py
+user text --appraise--> ΔPAD --apply--> PADState (decays to a baseline) --> label
+                                              |--> prompt hint   (one system line, only when she feels something)
+                                              |--> voice speed   (Kokoro can do nothing else)
+                                              `--> "EmotionChanged" on the bus   (the avatar, M14)
 ```
 
-The system should maintain state across time.
+| File | Role |
+|---|---|
+| `emotion/pad.py` | `PAD` (a point or a delta) and `PADState`: `tick()` decays toward the baseline, `apply()` adds a delta, `label()` reads it out |
+| `emotion/appraisal.py` | rule-based `appraise(text) -> ΔPAD + the tags that explain it` |
+| `emotion/labels.py` | nearest-prototype labels (`flustered`, `annoyed`, `angry`, `happy`, `curious`, `concerned`, `sad`...) and the one-line prompt hints |
+| `emotion/engine.py` | `EmotionEngine`: owns the state, builds the hint and the voice style, publishes `EmotionChanged`, fades the mood while nobody talks |
+| `config/emotion.yaml` | baseline, half-lives, strength, voice-speed mapping (every number is a hand-picked starting point) |
 
-Example:
+## 39.1 Design decisions
 
-```python
-pad = PADState(
-    pleasure=0.0,
-    arousal=0.0,
-    dominance=0.0
-)
-```
+* **Rules, not the LLM.** Appraisal is on the critical path (utterance -> appraisal -> prompt). A second LLM call
+  would add a generation's worth of latency on a full GPU. Rules cost microseconds, and every decision comes
+  back as a tag (`why: praise`), so "why is she annoyed?" has an answer. Unrecognised text changes nothing.
+* **The character's wiring is in the deltas.** A compliment raises arousal and *lowers* dominance (flustered), an
+  insult raises dominance (she pushes back). That is the tsundere signature, written as numbers.
+* **Neutral is exactly the old behaviour.** Within `NEUTRAL_RADIUS` of the baseline the prompt gets no hint and the
+  voice speed is exactly 1.0. The persona you tuned is untouched until she feels something.
+* **The hint is in the volatile tail**, one system message just before the user's turn, never in history. The
+  system prompt stays byte-identical turn to turn (stable prefix), and a stale "you are angry" cannot survive.
+* **Voice: speed only.** Kokoro takes a speed and nothing else. `speed = 1 + 0.10 x dArousal + 0.04 x dPleasure`,
+  clamped 0.90-1.12, from the deviation from baseline.
 
-Then update it using deltas.
+## 39.2 What the live run taught (all fixed, all pinned by tests)
+
+Unit tests passed first time. Replaying the conversation with the real model found three things they could not:
+
+1. **Arousal pinned at +1.0** after two arousing events, so every later mood looked "curious" (`Hey Christina` came out
+   curious, not annoyed). Fix: diminishing returns near the bounds (a delta is shrunk by the room left in its direction,
+   never enlarged).
+2. **A fading mood wandered through unrelated labels** (flustered -> curious -> concerned) because the straight path
+   back to the baseline passes near other prototypes. Fix: between events the label's name is frozen and only its
+   intensity fades.
+3. **The label now follows the event, not the blended state.** A new event renames the mood only if it is at least 60%
+   as strong as the mood in force; a weaker one adds to it without renaming it.
+
+Also found by running the phrases: negation was broken ("You're not stupid", "I'm not sad" matched nothing, because the
+negator sits inside the phrase). Fixed, and a `can't believe you're so smart` false-negation removed.
+
+Mutation checks were run on the M9 logic (14 deliberate breakages: each one is caught by a named test).
+
+## 39.3 Honest limits
+
+* **The prompt hint helps a little on small talk and not at all on factual answers.** Controlled A/B (same seeds, same
+  prompt, with vs without the hint, 7 moods x 3 held-out lines x 3 seeds): 0 of 63 replies leaked the mood or the
+  instructions, short social replies took on some colour ("Ugh, thanks. I don't drink caffeine." when angry), but a
+  question about neurons opened "Sure!" in every mood. There was no null-control run, so no effect size is claimed.
+  The same 3B-model ceiling as the persona (README section 45): the real fix is a persona LoRA (M15).
+* **Replies still copy the persona's example lines** word for word on matching prompts, which also hides the hint.
+* **Coverage.** Rules fire on English keywords, so a feeling expressed in other words is missed (it fails safe: nothing
+  changes). Add a rule in `appraisal.py` plus a sentence in `tests/test_appraisal.py` (a test fails if any rule has none).
+* **Hand-tuned numbers.** Prototypes, deltas and half-lives are judgement, not data. Tune `config/emotion.yaml` while
+  watching the `[mood: ...]` line printed after each turn.
+* **Not persisted.** Mood resets each run (memory is M10). It appraises what the user says, not what she says.
+* **Not heard.** The speed change is deterministic and tested, but nobody has judged how it sounds.
 
 ---
 
@@ -1960,21 +2002,82 @@ without requiring a full response.
 
 # 44. M14 — Avatar
 
-Only after the voice system works:
+## 44.0 Status: built and tested (2026-11-10). Browser preview runs and was watched; VTube Studio is mock-tested only.
 
 ```text
-PAD
- ↓
-Emotion
- ↓
-Expression
- ↓
-VTube Studio
+bus "EmotionChanged" --\
+bus "StateChanged"  ----+--> ExpressionModel.step(dt) --> ExpressionFrame --> sinks
+player.level -----------/        (30 Hz, smoothed)         (12 face values)    |- browser preview (SVG, no model needed)
+ (loudness of the audio                                                        `- VTube Studio (Live2D, needs a model)
+  actually being played)
 ```
 
-The avatar is an output consumer.
+The avatar is an **output consumer** (README section 26): it listens to the bus and reads the speaker level, and never
+writes to cognition, memory or the state machine. A test runs the same reply with and without an avatar attached and
+requires identical speech; another shows a broken avatar (port taken, renderer crash) leaves the voice running.
 
-Keep it isolated from core cognition.
+| File | Role |
+|---|---|
+| `expression/frame.py` | `ExpressionFrame` and `ExpressionModel`: emotion + system state + speech level -> mouth, smile, eyes, brows, blush, head, gaze; smoothing, blinking, idle sway. Pure maths, no renderer |
+| `expression/driver.py` | `AvatarDriver`: fixed-rate loop, bus subscriptions, fans frames out to sinks, isolates a failing sink |
+| `expression/server.py` + `web/avatar.html` | local browser preview (aiohttp, 127.0.0.1 only) and a self-contained SVG face |
+| `expression/vtube.py` | `VTubeStudioSink`: auth, parameter discovery, injection, hotkeys, automatic reconnect |
+| `synthesis/audio_out.py` | each player gained `level` (RMS of the block just sent to the device) for lip-sync |
+| `scripts/avatar_demo.py` | shows the whole chain with no LLM, GPU or microphone |
+
+## 44.1 Run it
+
+```text
+venv/Scripts/python.exe -m amadeus.main --avatar            # real conversation; open http://127.0.0.1:8765/
+venv/Scripts/python.exe scripts/avatar_demo.py              # scripted tour, silent, no GPU needed
+venv/Scripts/python.exe scripts/avatar_demo.py --hold "Hey Christina." --speak     # hold one pose
+```
+
+Add `?debug` to the URL to see the raw numbers. `config/settings.yaml` `avatar:` sets the port, the frame rate and VTube Studio.
+
+## 44.2 What was measured
+
+| | Result |
+|---|---|
+| Frame rate to a browser, 9 s of live frames | **30.1 fps**, p99 inter-frame gap 48 ms |
+| Cost of one tick (model + browser sink, 180 ticks) | **p50 0.25 ms, p99 0.46 ms, max 0.68 ms** of a 33 ms frame |
+| Lip-sync, live, with real Kokoro audio | mouth swept 0 to 0.998 with open/close transitions at word gaps |
+| Voice latency with emotion + avatar on (3 real turns) | first sound **p50 1102 ms / p95 1668 ms**, still inside the 1200 / 1800 targets |
+| Real app, recorded live from the browser (3 turns, real LLM) | per turn IDLE -> THINKING -> SPEAKING -> IDLE with the right label each time; mouth open in 273 frames (peak 1.0); blush peaked 0.64 |
+| Poses watched in the browser | flustered, annoyed, concerned, happy, angry: distinct and legible |
+
+Looking at the rendered avatar and then recording the real app found three bugs the unit tests had passed:
+
+1. A dark band between hair and shoulders (layering).
+2. "concerned" drawn with furrowed (angry) brows, because her high resting dominance made the maths read concern as anger.
+3. **The face disagreed with the label.** 14 s after a compliment, "Hey Christina" gave the label *annoyed 0.78* but a face
+   with blush 0.57, a smile and barely furrowed brows: the face followed the accumulated PAD (still holding the compliment)
+   while the label followed the event. Each label now has an expression preset (`frame.py _PRESETS`) blended in by its
+   intensity (up to 75%), with PAD supplying the continuous shading. A test replays that exact sequence through the real
+   engine and model; turning the presets off makes it fail.
+
+## 44.3 VTube Studio: what is and is not known
+
+The message flow follows the official README (port 8001, token auth approved by the user in-app,
+`InputParameterListRequest`, `InjectParameterDataRequest`, custom parameters, hotkeys). The sink asks VTube Studio which
+parameters exist and **only drives those**, and scales each value into that parameter's own reported min/max/default,
+because the README does not list the default parameter names and I did not want to hard-code guesses.
+
+Tested against a **mock** server that speaks the documented protocol (14 tests: first-run pairing, reuse of the saved
+token, a revoked token, access denied, missing parameters, scaling, hotkeys, VTube Studio not running yet, restart and
+reconnect). **Never run against a real VTube Studio**, because there is no Live2D model. Expect to need
+`vtube_invert` for a parameter that moves the wrong way, and `vtube_hotkeys` to map moods to the model's expressions.
+Two custom parameters (`AmadeusBlush`, `AmadeusBrowInner`) appear in VTube Studio for you to map.
+
+## 44.4 Honest limits
+
+* **The browser face is a flat SVG placeholder, not the 3D/Live2D avatar.** It exists so the chain can be seen and tested
+  now. A real model is a separate, large piece of work.
+* **Mouth is amplitude only.** It opens with loudness; there are no phoneme shapes (visemes).
+* **Head turns are faked in the browser** as a small translation plus roll; a flat drawing cannot turn.
+* **Lip-sync needs the streaming player** (`audio.streaming_output: true`); the legacy player reports level 0.
+* **Numbers are judgement.** Smoothing times, brow angles and the blush formula are hand-tuned by eye on one drawing.
+* **Not judged by a person in motion.** I could check frames, rates and stills, not whether the animation feels alive.
 
 ---
 

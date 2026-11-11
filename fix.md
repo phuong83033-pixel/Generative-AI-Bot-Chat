@@ -1257,3 +1257,133 @@ silence between clauses [0, 0] ms
   `words count mismatch on 100.0% of the lines`** for some clauses, not yet investigated.
 * **Uncommitted:** everything in this part. README sections 4.1 and 8 still carry the old
   Kokoro figures; the Word reference and the architecture page still show Edge-TTS.
+
+---
+
+# PART 5 — The Kurisu voice investigation, emotion (M9) and avatar (M14)
+
+Written 2026-11-10. Three pieces of work, and in each one the first number or the first green test run was
+wrong in a way only a second look exposed. That is the real content of this part.
+
+## 34. Can the statistics of Kokoro's voice be moved to match the reference clip?
+
+**Question.** You picked `audio (1).wav` (English, 24 kHz, 6.7 s) as the voice you want and asked whether Kokoro's
+statistics can be fixed to sound like it, and said to move on if the cost was too high.
+
+**Measured gap.** Reference: median pitch 296 Hz, range 8.3 semitones, spectral centroid 562 Hz. Kokoro's 15
+female voices: 143 to 208 Hz. The nearest is +6 semitones away, `af_heart` (current) +7.4. No blend of voices can
+reach it, because a blend lies between its parts.
+
+**A way to measure "same voice".** I installed two speaker-identification models (WeSpeaker ResNet34, 26 MB each, run
+through onnxruntime; one trained on VoxCeleb, one on CN-Celeb) and calibrated them on your three clips. Cosine
+similarity of the same character across languages: 0.66 (VoxCeleb model) and 0.82 (CN-Celeb model). Raw Kokoro
+voices to the target: 0.10 to 0.43 on all 15 with the VoxCeleb model; the CN-Celeb model I only ran on the handful
+of voices in the second table below (0.32 to 0.65).
+
+**What I tried, and what each gave (scored by the VoxCeleb model, the first one I had):**
+
+| Approach | Similarity | Cost at run time |
+|---|---:|---|
+| `af_heart` raw (current) | 0.31 to 0.34 | none |
+| Praat pitch shift to 296 Hz (+ formant ratio 1.0) on `af_nicole` | 0.35 to 0.49 | 7 ms per second of speech |
+| Raising the formants as well | worse in every case | |
+| **Search of Kokoro's 256-number style vector** (16 axes, 193 evaluations, 9 min), judged on lines it was not tuned on | **0.55 to 0.56**, Whisper word error 0% | none (a saved array) |
+
+**The correction.** I reported "0.31 to 0.55" as a result. It was not. Scored by the *second* model, which the search
+never saw, the searched voice was **worse than the current one** (0.44 against 0.48), and Praat shifting hurt
+(0.29 against 0.32). The search had learned to please the first model, not to sound like her. Held-out *sentences*
+do not protect against that; a held-out *judge* does, and it showed the gain was mostly artefact.
+
+| Voice (4 held-out lines) | VoxCeleb model | CN-Celeb model |
+|---|---:|---:|
+| `af_heart` (current) | 0.31 | 0.48 |
+| `af_nicole` + Praat 296 Hz | 0.35 | 0.29 |
+| searched style vector | 0.56 | 0.44 |
+| **`bf_isabella` raw** | 0.40 | **0.65** |
+
+**What survives.** Both models rank `bf_isabella` best among raw Kokoro voices, and both say Praat pitch shifting does
+not reliably help. Everything else here is one model's opinion.
+
+**What cannot be measured.** How it sounds. I cannot hear, and two speaker models disagreeing shows the proxies are not
+trustworthy enough to decide. So I built a **blind listening pack**: `data/audition/blind/reference_TARGET.wav` plus
+`clip_1..4.wav` (the four candidates in a shuffled order, same sentence, same loudness, −20.5 dBFS). The key is kept
+outside the project and unread. Play it with `scripts/play_wavs.py --blind` and tell me which clips sound closest.
+
+**Verdict on cost.** The cheap routes are exhausted: pitch shifting does not help, and a style-vector search overfits
+whatever judge it is given. The only zero-cost change with support from both judges is switching to `bf_isabella`,
+which I have **not** applied because you have not heard it. Real fidelity needs the teacher (the 1.7B Qwen3-TTS Kurisu
+model, on a rented or free GPU) and either a distilled small model or a remote voice. That is a decision for after
+you have listened.
+
+## 35. M9 — what the first run got wrong
+
+Tests were green first time (the logic did what I wrote). Replaying real conversations through it found:
+
+| Found by | Defect | Fix |
+|---|---|---|
+| running the phrases | negation broken: "You're **not** stupid", "I'm not sad" matched nothing, because the negator is *inside* the phrase | patterns allow a negator; detection looks inside the match as well as before it |
+| running the phrases | "I can't believe you're so smart" counted as negated praise | `can't` / `won't` dropped from the negator list |
+| a decay table | a fading *flustered* passed through *curious* and *concerned* | the label's name is frozen between events; only intensity fades |
+| the live 6-turn run | `Hey Christina` came out **curious 1.00**: arousal pinned at +1.0 after two events | diminishing returns near the bounds (shrink a delta by the room left, never enlarge it); the label now follows the event, and renames the mood only if the event is at least 60% as strong |
+| the phrases again | "Shut up!" came out *annoyed* once deltas shrank | separate `hostility` rule, harsher than an insult |
+
+**Does the mood change what she says?** Controlled test: same prompt and seeds, with vs without the hint, 7 moods x 3
+held-out user lines x 3 seeds. **0 of 63** replies leaked the mood or the instructions. Short social replies took on
+some colour; a factual question opened "Sure!" in every mood, angry included. No null-control was run, so no effect size
+is claimed. The hint is harmless and slightly useful on small talk. The 3B model's habit of copying the persona's example
+lines word for word hides it further. M15 (persona LoRA) is the real fix.
+
+**Mutation checks.** 14 deliberate breakages of the M9 logic, each caught by a named test. (My first attempt skipped
+one because the match string did not fit the file's whitespace; I reran it rather than count it.)
+
+## 36. M14 — what looking at it found
+
+Unit and integration tests were green. Rendering the face, then recording the real application driving it, found three
+more defects:
+
+1. **Layering.** A dark band between hair and shoulders.
+2. **"Concerned" had angry brows.** Brow direction came from dominance, and her resting dominance is high, so concern read
+   as anger. It now follows the label (worried vs angry), with a regression test.
+3. **The face disagreed with the label.** From a live recording: 14 s after a compliment, "Hey Christina" gave the label
+   *annoyed 0.78* but a face with blush 0.57, a smile and brows barely furrowed. The face followed the accumulated PAD;
+   the label followed the event. Each label now has an expression preset blended in by intensity. A test replays that
+   exact sequence through the real engine and model; with the presets disabled it fails.
+
+**Mutation checks.** 13 breakages of the avatar code: 12 caught, **1 missed**, and the miss was a real hole in a test
+(every range tested had its neutral value at the midpoint, so "centre on the default" and "centre on the midpoint" were
+indistinguishable). Fixed with a range whose default is not the midpoint, then re-checked. Later, the preset blend got
+its own check (caught).
+
+**Measured.** 30.1 fps to a browser (p99 inter-frame gap 48 ms); tick cost p50 0.25 ms, max 0.68 ms of a 33 ms budget;
+real app, three turns, first sound p50 1102 / p95 1668 ms (targets 1200 / 1800: still met with emotion and avatar on).
+
+**VTube Studio.** Written from the official README. It discovers the model's parameters and scales each value into the
+parameter's own reported range, because the README does not list the default parameter names and I would not guess.
+Fourteen tests against a mock server that speaks the documented protocol (pairing, token reuse and revocation, denial,
+missing parameters, scaling, hotkeys, not-running-yet, restart and reconnect). **Never run against a real VTube Studio.**
+
+## 37. A tooling accident worth recording
+
+I patched `run.md` with a shell heredoc. The shell turned `\\` into `\`, so Python read `.\venv` as a **vertical tab**
+plus `env`, and `scripts\avatar_demo` lost its `\a` to a bell character. Ten invisible control characters would have
+broken every copy-pasted command in the new sections. Found by reading the result back, repaired with a script, and
+the whole project scanned for control characters (none left). Documents are now edited with the file-edit tool, not
+heredocs.
+
+## 38. Corrections to what I told you earlier
+
+* **"Style search lifts similarity from 0.31 to 0.55"**: retracted, see §34.
+* **"`run.md`: voice path unproven"** was stale: you tested M3, M4 and M7 live and accepted them. Updated.
+* **The plan implied the mood hint would visibly steer a 3B model.** Measured: barely, and not at all on factual answers.
+
+## 39. Outstanding after Part 5
+
+* **Listen to the blind pack** (`scripts/play_wavs.py --blind`) and say which clips sound closest to the reference. Then
+  decide: switch to `bf_isabella`, or invest in the teacher/student route, or leave the voice.
+* **M14 on a real Live2D model** in a real VTube Studio: the one piece never exercised.
+* **Persona fidelity** (M15) is still the cap on how in-character she sounds.
+* **Whisper in-app time** (~580 ms vs 190-310 ms standalone) is still unexplained.
+* **Tracker (`.xlsx`), the Word reference and the architecture page are stale**: no M9, M14, voice work, or Kokoro.
+* **Uncommitted and unpushed** (you have not asked): everything from M8 onward on this branch, i.e. `.gitignore`,
+  `main.py`, `config.py`, `settings.yaml`, `emotion.yaml`, `persona.yaml`, `amadeus/emotion/`, `amadeus/expression/`,
+  `scripts/audition_voices.py`, `scripts/play_wavs.py`, `scripts/avatar_demo.py`, and 205 passing tests (2 expected xfail).

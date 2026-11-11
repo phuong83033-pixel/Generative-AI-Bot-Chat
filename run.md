@@ -2,10 +2,10 @@
 
 Everything needed to get the project running, with copy-paste commands.
 
-> **Current stage: M8 (streaming pipeline), on top of the M7 voice loop.** A turn-based voice loop:
-> mic → VAD → Whisper → Qwen → clause chunker → Kokoro (local voice) → speakers.
-> **No avatar, no emotion engine, no memory, no proactive speech yet** — those are
-> M9 through M14. See README §28.
+> **Current stage: M9 (emotion) and M14 (avatar) on top of M8 (streaming) and the M7 voice loop.** A turn-based
+> voice loop: mic → VAD → Whisper → Qwen → clause chunker → Kokoro (local voice) → speakers, with a PAD mood that
+> colours the reply and the voice speed, and an optional avatar that reacts to the mood and to her speech.
+> **No memory, no proactive speech, no barge-in yet** — those are M10 to M13. See README §28.
 
 > **WEAR HEADPHONES.** `perception/aec.py` is a pass-through stub, so on speakers
 > the agent hears itself, trips its own voice detector and starts answering
@@ -36,6 +36,18 @@ Run it for real, headphones on:
 ```
 
 Type or say `exit` to quit. `Ctrl+C` also works.
+
+See the avatar react (open **http://127.0.0.1:8765/** in a browser once it says `[avatar preview: ...]`):
+
+```bash
+.\venv\Scripts\python.exe -m amadeus.main --avatar
+```
+
+No GPU, mic or LLM needed, just to look at the avatar and the emotion engine:
+
+```bash
+.\venv\Scripts\python.exe scripts\avatar_demo.py
+```
 
 ---
 
@@ -258,6 +270,7 @@ launches read it from cache.
 | `--text` | type instead of speaking; no mic, VAD or STT |
 | `--turns N` | exit after N turns — useful for benchmarking |
 | `--mute` | no sound: playback is simulated by waiting out each clip's real duration |
+| `--avatar` | start the avatar (browser preview at `http://127.0.0.1:8765/`, and VTube Studio if enabled in `settings.yaml`) |
 | `--log-level LEVEL` | `DEBUG`, `INFO`, `WARNING`, `ERROR`. Default `INFO` |
 
 Quiet run, three turns:
@@ -265,6 +278,42 @@ Quiet run, three turns:
 ```bash
 .\venv\Scripts\python.exe -m amadeus.main --turns 3 --log-level WARNING
 ```
+
+### Emotion (M9)
+
+After each thing you say, the app prints what she felt and why, for example:
+
+```text
+[mood: flustered 0.73 | P+0.24 A+0.43 D-0.25 | why: praise | voice x1.05]
+```
+
+The mood fades back to neutral over a minute or two, colours the next replies, and nudges the voice speed
+(Kokoro can change nothing else). Try, in text mode: `You're really smart.`, `Hey Christina.`,
+`I had a bad day today.`, `Shut up!`, `Do you like Dr Pepper?`. Unrecognised sentences change nothing.
+Tune `config/emotion.yaml` (`appraisal_strength: 0` turns the reactions off, `enabled: false` removes the feature).
+
+### Avatar (M14)
+
+```bash
+.\venv\Scripts\python.exe -m amadeus.main --avatar
+```
+
+then open `http://127.0.0.1:8765/` (add `?debug` for the raw face values). The face blinks, follows the mood
+(blush, brows, smile, gaze), looks up while she thinks, and the mouth follows the audio actually being played.
+It is a **flat placeholder drawing, not a 3D or Live2D model**. Other ways to run it:
+
+```bash
+.\venv\Scripts\python.exe scripts\avatar_demo.py --sound                    # scripted tour, with audio
+.\venv\Scripts\python.exe scripts\avatar_demo.py --hold "Hey Christina." --speak   # hold one mood
+.\venv\Scripts\python.exe scripts\avatar_demo.py --hold "You're really smart." --hold "Shut up!" --hold-secs 12
+```
+
+**VTube Studio** (only once you have a Live2D model): in VTube Studio load the model and enable the API
+(Settings, "Start API", port 8001); in `config/settings.yaml` set `avatar: vtube: true`; run with `--avatar`;
+click **Allow** in the popup inside VTube Studio (once; the token is saved in `data/vtube_token.txt`). Two
+custom parameters appear in VTube Studio, `AmadeusBlush` and `AmadeusBrowInner`, for you to map. If a part of
+the model moves the wrong way, list its parameter in `avatar: vtube_invert:`. This path has been tested only
+against a mock VTube Studio, never a real one.
 
 ### Stopping
 
@@ -454,6 +503,19 @@ hears itself, because echo cancellation is still a stub (§7, "talking to itself
 
 Pick a device with `AMADEUS_AUDIO_OUTPUT_DEVICE` in `.env` (a name fragment such as `Headphones`).
 
+### The avatar page says "reconnecting" or will not load
+
+The app must be running with `--avatar` (or `avatar.enabled: true`); the page connects to it and reconnects
+by itself. `Port 8765 ... Another program is using it`: change `avatar.web_port` in `config/settings.yaml`.
+Without `--avatar` nothing listens on that port. The page is served only to this computer (127.0.0.1).
+
+### VTube Studio does not react
+
+Check, in order: VTube Studio is running with a model loaded; its API is started (port 8001); you clicked
+**Allow** on the popup (watch the log for "VTube Studio ready: driving N parameters"); the model actually has
+the parameters (the log lists any it lacks). To pair again, delete `data/vtube_token.txt`. If it was denied,
+the app retries about once a minute.
+
 ### Using the cloud voice instead
 
 Set `tts.provider: edge` in `config/settings.yaml`. It needs network access and ffmpeg, and adds
@@ -501,6 +563,7 @@ Run the automated tests (about 10 s, no GPU or sound device needed):
 |---|---|
 | `config/settings.yaml` | audio, VAD, STT, LLM, TTS parameters and latency targets |
 | `config/persona.yaml` | character name, traits and system prompt |
+| `config/emotion.yaml` | M9: mood baseline, how fast it fades, how reactive she is, how it changes the voice speed |
 | `.env` | optional device overrides and `AMADEUS_LOG_LEVEL` |
 
 Useful knobs in `settings.yaml`:
@@ -519,7 +582,20 @@ chunker:
   first_clause_min_chars: 16   # see section 6
   first_clause_max_chars: 30   # null = never cut mid-sentence
 audio:
-  streaming_output: true       # false = older player (adds ~200 ms of silence per clip)
+  streaming_output: true       # false = older player (adds ~200 ms of silence per clip; no lip-sync)
+avatar:                        # M14, off by default; `--avatar` turns it on for one run
+  enabled: false
+  web_port: 8765               # browser preview at http://127.0.0.1:<web_port>/
+  vtube: false                 # true = also drive VTube Studio (needs a Live2D model)
+```
+
+and in `config/emotion.yaml`:
+
+```yaml
+enabled: true                  # false = no mood at all (pre-M9 behaviour)
+appraisal_strength: 1.0        # 0 = she never reacts, 2 = twice as reactive
+half_life_s: {pleasure: 90, arousal: 45, dominance: 120}   # seconds for a mood to halve
+hint_min_intensity: 0.25       # fainter moods add nothing to the LLM prompt
 ```
 
 List the Kokoro voices:
@@ -533,20 +609,26 @@ voices with `.\venv\Scripts\python.exe -m edge_tts --list-voices`.
 
 ---
 
-## 10. Known limits at M8
+## 10. Known limits at M9 / M14
 
-* **No avatar.** Nothing renders. M14.
-* **No emotion engine.** The PAD model is designed, not built. M9.
+* **The avatar is a flat placeholder drawing**, not a 3D or Live2D model. The VTube Studio connection exists but has
+  only been tested against a mock server, never a real VTube Studio (there is no model yet). The mouth follows
+  loudness only (no phoneme shapes). README §44.4.
+* **Emotion helps a little, not a lot.** The mood changes the voice speed (deterministic) and adds one line to the
+  prompt, which the 3B model follows weakly on small talk and ignores on factual answers. Its rules only recognise
+  English keywords. The numbers are hand-tuned and nobody has judged them by ear. README §39.3.
+* **The mood is not remembered between runs** and only reacts to what you say, not to what she says.
 * **No memory.** The agent forgets everything when you exit; within a session it
   keeps a short rolling history. M10–M11.
 * **No proactive speech.** It only answers; it never starts a conversation. The
   state machine now permits it, but `drive.py` does not exist. M12.
 * **No barge-in.** You cannot interrupt it mid-sentence. M8.
 * **No echo cancellation.** Headphones required. M13.
-* **Local voice has no emotion.** Kokoro offers a choice of voice and a speed, not pitch or energy control, so mood can only change which voice and how fast. M9.
+* **The local voice can only change speed with mood.** Kokoro offers a choice of voice and a speed, not pitch or energy control, so that is all M9 can do to it.
+* **The voice is not Kurisu's.** Kokoro's voices cannot be cloned, and their pitch tops out near 208 Hz against about 296 Hz in the reference clip. See `fix.md` Part 5.
 * **Never listened to by its author.** The first-clause cap and the new output stream are verified by measurement and tests, not by ear (§6, §7).
-* **Voice path unproven.** The microphone opens and the detector listens, but no
-  real utterance has yet been captured and transcribed end to end. Text mode is
-  verified working.
+* **Voice path checked live by you, not exhaustively.** You spoke to it and judged M3 (mic + VAD), M4 (STT) and
+  M7 (voice loop) "quite alright", with a note to fix again if needed. Whisper's in-app time (~580 ms) is
+  still slower than it measures on its own (190-310 ms) and is unexplained.
 
 Full roadmap in README §28–45. Defect history in `fix.md`.
