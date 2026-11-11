@@ -44,6 +44,13 @@ class SileroVAD:
 
     async def listen_until_speech_ends(self, mic: MicrophoneStream, stop: asyncio.Event) -> Optional[np.ndarray]:
         """Listen to mic, accumulate speech, return when silence detected."""
+        # Silero is a recurrent model: its hidden state carries over between calls.
+        # Start each utterance clean so the previous one cannot bias this one.
+        try:
+            self.model.reset_states()
+        except AttributeError:
+            pass  # a model without recurrent state has nothing to reset
+
         chunk_ms = (mic.chunk_size / self.sample_rate) * 1000
         pad_chunks = int(self.pre_speech_pad_ms / chunk_ms)
         

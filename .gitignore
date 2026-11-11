@@ -8,3 +8,8 @@ amadeus_ai.egg-info/
 *.egg-info/
 .pytest_cache/
 ~$*
+data/audition/
+data/vtube_token.txt
+# Reference clips of the fan Kurisu voice model (audio.wav, "audio (1).wav"). The model's terms grant no
+# redistribution rights, so they stay on this machine.
+/*.wav

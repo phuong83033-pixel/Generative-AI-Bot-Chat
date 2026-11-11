@@ -58,6 +58,22 @@ class MicrophoneStream:
             self._stream = None
             self.tracer.info("Microphone stream stopped.")
 
+    def flush(self) -> int:
+        """Drop everything recorded so far; return how many chunks were dropped.
+
+        The stream keeps recording into an unbounded queue the whole time the agent
+        is thinking and speaking. Without this, the next listen would start by
+        replaying that backlog: the agent's own reply picked up by the microphone,
+        or the user talking over it, treated as a fresh question.
+        """
+        dropped = 0
+        while True:
+            try:
+                self.queue.get_nowait()
+                dropped += 1
+            except asyncio.QueueEmpty:
+                return dropped
+
     async def read_chunk(self) -> np.ndarray:
         """Read a single audio chunk. Blocks until available."""
         return await self.queue.get()
